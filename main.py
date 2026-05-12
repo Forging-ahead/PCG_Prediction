@@ -98,6 +98,9 @@ def _process_one_patient(stl_path, post_tips, params, steps):
                 min_relative_length=params['min_relative_length'],
                 min_radius_ratio=params['min_radius_ratio'],
                 keep_radius_ratio=params['keep_radius_ratio'],
+                absolute_min_branch_length_mm=params[
+                    'absolute_min_branch_length_mm'],
+                absolute_min_radius_mm=params['absolute_min_radius_mm'],
                 merge_bp_distance_mm=params['merge_bp_distance_mm'])
             print(f"  [Step 1] 中心线提取: {time.time()-t0:.2f}s")
             status['centerline'] = True
@@ -358,6 +361,10 @@ DEFAULT_PARAMS = {
     'min_radius_ratio': 0.4,
     'keep_radius_ratio': 0.55,       # 保护门: r_branch/r_junction ≥ 0.55 时
                                       # 视为真分支, 跳过所有长度判据
+    'absolute_min_branch_length_mm': 3.0,  # 硬阈值: 弧长 < 3mm 必为骨架毛刺,
+                                            # 跳过保护门强剪
+    'absolute_min_radius_mm': 0.75,        # 硬阈值: max_radius < 0.75mm
+                                            # (≤1.5 体素) 必为噪声, 强剪
     'merge_bp_distance_mm': 5.0,
 
     # 特征 / 剖面

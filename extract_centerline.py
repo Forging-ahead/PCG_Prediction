@@ -7,10 +7,15 @@
       → BFS建树
 
 新增剪枝策略:
+  (-1) **硬阈值 (新)**: 末端分支极短 (< absolute_min_branch_length_mm) 或
+       极细 (max_radius < absolute_min_radius_mm) → 无条件剪除. 即使其半径
+       占比看起来很大也按噪声处理 (skeletonization 在曲面凸起处的毛刺).
   (0) **保护门 (新)**: 末端分支最大半径 / 父主干半径 ≥ keep_radius_ratio
        → 视为真实分支, 跳过所有长度/相对长度判据.
        目的: 避免短-但-粗 的真实小分支被长度阈值误剪
        (Murray 定律下子血管半径 ≈ 0.6~0.8 × 父血管, 远高于噪声毛刺 0.1~0.2)
+       注: branch_max_radius 计算**必须排除 junction 节点**, 否则距离变换
+       在分叉点处会把主干体积算进去, 使保护门对所有毛刺都误触发.
   (1) 物理长度阈值: 末端分支弧长 < min_branch_length_mm 剪除
   (2) 相对长度阈值: 末端分支弧长 < total_length × min_relative_length 剪除
   (3) 半径判据: 末端分支最大半径 < 父主干半径 × min_radius_ratio 剪除
@@ -36,6 +41,8 @@ def extract_centerline(stl_path, output_txt_path=None,
                        min_relative_length=0.05,
                        min_radius_ratio=0.4,
                        keep_radius_ratio=0.55,
+                       absolute_min_branch_length_mm=3.0,
+                       absolute_min_radius_mm=0.75,
                        merge_bp_distance_mm=5.0,
                        max_prune_iterations=20,
                        verbose=True):
@@ -58,6 +65,14 @@ def extract_centerline(stl_path, output_txt_path=None,
                                 目的: 保护短-但-粗 的真实分支 (常见于
                                 LPV/RPV/LGV/PGV 末端). 默认 0.55:
                                 noise spur 通常 < 0.3, 真分支多在 0.6+.
+        absolute_min_branch_length_mm:
+                                **硬剪阈值**, 默认 3.0mm. 末端分支弧长 < 此值
+                                必为骨架毛刺 (1~5 体素的表面凸起), 直接剪除,
+                                **跳过保护门**. 真血管分支不会短于 3mm.
+        absolute_min_radius_mm: **硬剪阈值**, 默认 0.75mm. 末端分支最大半径
+                                (排除 junction) < 此值必为噪声 (相当于 ≤ 1.5
+                                体素厚度的凸起), 直接剪除. 真血管即使细如
+                                LGV/PGV, 半径也 ≥ 1mm.
         merge_bp_distance_mm:   两个分支点距离小于此值时合并
         max_prune_iterations:   剪枝最大迭代次数
         verbose:                打印进度
@@ -107,6 +122,8 @@ def extract_centerline(stl_path, output_txt_path=None,
         min_relative_length=min_relative_length,
         min_radius_ratio=min_radius_ratio,
         keep_radius_ratio=keep_radius_ratio,
+        absolute_min_branch_length_mm=absolute_min_branch_length_mm,
+        absolute_min_radius_mm=absolute_min_radius_mm,
         merge_bp_distance_mm=merge_bp_distance_mm,
         max_iterations=max_prune_iterations,
         verbose=verbose)
@@ -185,6 +202,8 @@ def _enhanced_prune(G, id_to_point, id_to_radius, pitch,
                     min_relative_length,
                     min_radius_ratio,
                     keep_radius_ratio,
+                    absolute_min_branch_length_mm,
+                    absolute_min_radius_mm,
                     merge_bp_distance_mm,
                     max_iterations,
                     verbose):
@@ -193,10 +212,11 @@ def _enhanced_prune(G, id_to_point, id_to_radius, pitch,
 
     每轮:
       a) 找所有末端分支(从端点沿度=2 节点走到下一个度!=2 节点)
-      b) **保护门**: 若分支最大半径 / 主干半径 ≥ keep_radius_ratio,
+      b) **硬阈值**: 极短或极细分支 (低于绝对阈值) 无条件剪除, 跳过保护门
+      c) **保护门**: 若分支最大半径 / 主干半径 ≥ keep_radius_ratio,
                      视为真实分支, 跳过该轮所有剪枝判据
-      c) 剪掉满足任一长度/半径判据的分支
-      d) 合并近邻分支点
+      d) 剪掉满足任一长度/半径判据的分支
+      e) 合并近邻分支点
     直到稳定或达到最大迭代。
     """
     n_pruned_total = 0
@@ -229,26 +249,45 @@ def _enhanced_prune(G, id_to_point, id_to_radius, pitch,
             branch_length = _path_arc_length(G, branch_path)
 
             # 末端分支最大半径
-            branch_max_radius = max(
-                id_to_radius[n] for n in branch_path)
+            # *关键*: 必须排除 junction 节点 — 距离变换在分叉点处会"看到"
+            # 主干体积, 给 junction 一个 = 主干半径的大值. 若把 junction
+            # 算进 max, 任何毛刺都会得到 ratio=1.0, 保护门对所有毛刺误触发.
+            spur_only_nodes = [n for n in branch_path if n != junction]
+            if not spur_only_nodes:
+                continue
+            branch_max_radius = max(id_to_radius[n] for n in spur_only_nodes)
 
             # 父主干半径(取分支点处的半径)
             junction_radius = id_to_radius[junction]
 
-            # ---- 保护门: 半径占比足够大 → 视为真实分支, 不剪 ----
+            # ---- (-1) 硬阈值: 极短 / 极细 → 必为噪声, 跳过保护门强剪 ----
+            absolute_short = branch_length < absolute_min_branch_length_mm
+            absolute_thin = branch_max_radius < absolute_min_radius_mm
+
+            # ---- (0) 保护门: 半径占比足够大 → 视为真实分支, 不剪 ----
             # 即使分支较短, 只要其管径相对于分叉处足够粗, 物理上不可能是
             # 表面噪声毛刺 (skeletonization spur 的 r_max 通常 ≤ 1~2 个体素),
             # 真分支应当保留以免后续解剖分段缺失.
-            if (junction_radius > 1e-6 and
+            # 注: 硬阈值 (极短/极细) 优先, 不进保护门.
+            if (not absolute_short and not absolute_thin and
+                    junction_radius > 1e-6 and
                     branch_max_radius / junction_radius >= keep_radius_ratio):
                 n_kept_thick_this_round += 1
                 continue
 
-            # 三个判据
+            # ---- 三个判据 + 硬阈值 ----
             should_prune = False
             reason = ""
 
-            if branch_length < min_branch_length_mm:
+            if absolute_short:
+                should_prune = True
+                reason = (f"极短(L={branch_length:.2f}mm, "
+                          f"硬阈值 {absolute_min_branch_length_mm}mm)")
+            elif absolute_thin:
+                should_prune = True
+                reason = (f"极细(r={branch_max_radius:.2f}mm, "
+                          f"硬阈值 {absolute_min_radius_mm}mm)")
+            elif branch_length < min_branch_length_mm:
                 should_prune = True
                 reason = f"短(L={branch_length:.1f}mm)"
             elif branch_length < total_edge_length * min_relative_length:
