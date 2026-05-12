@@ -541,6 +541,142 @@ def _topology_features(seg_dict, stat_features, profile_data, branch_points):
 # 主入口
 # ============================================================
 
+# ============================================================
+# (F) 临床派生标量 (PVT / 海绵样变 / 侧支 / TIPS 规格)
+# ============================================================
+
+_CAVERNOUS_MPV_MAX_DIAM_MM = 5.0       # MPV 最大直径 < 此值 + 有侧支 → 海绵样变可疑
+_CAVERNOUS_BPDENSITY_PER_CM = 2.0       # 分叉点密度 > 此值 → 海绵样变可疑
+_PVT_SOLIDITY_NORMAL = 0.90             # solidity > 此值 → 无血栓
+_PVT_SOLIDITY_PARTIAL = 0.60            # solidity ∈ [0.6, 0.9] → 部分血栓
+
+
+def _clinical_summary_features(seg_dict, stat_features, profile_data,
+                                topology_out):
+    """
+    临床导向的标量摘要 (参考 PVP_feature_extraction_recommendations.md):
+      - sv_max_to_mpv_max_diam_ratio: 脾静脉/门静脉最大直径比 (PVH 信号)
+      - mpv_trunk_length_mm:          MPV 主干长度 (CSPH 患者常缩短)
+      - max_tortuosity_index /        每段 tortuosity = arc/chord 的最大/平均
+        mean_tortuosity_index           聚合, 反映整树迂曲水平
+      - max_collateral_diameter_mm:   LGV/PGV 最大直径 (侧支分流量化, 代
+                                       替易噪的 n_collaterals_detected)
+      - area_conservation_bifurc_deviation: |A_MPV − (A_LPV+A_RPV)| / A_MPV,
+                                       MPV 分叉处面积守恒偏离
+      - tips_stent_diameter_mm /      TIPS 支架的工程参数, 直接确定其阻力
+        tips_stent_length_mm            (R ∝ L / r⁴), 无需模型学习
+      - pvt_severity_grade ∈ {0,1,2}: 基于 MPV 沿线 solidity 最小值的血栓
+                                       严重度分级 (0 无, 1 部分, 2 严重)
+      - min_lumen_area_to_max_ratio_mpv:  MPV 沿线 min(A)/max(A), 局部
+                                       狭窄 / focal thrombus 指标
+      - cavernous_transformation_flag:    海绵样变启发式标志
+                                       (MPV 缺失 / 极细 + 多侧支 / 分叉
+                                       点密度异常高 任一成立 → 1)
+    """
+    out = {}
+
+    # ---------- (1) SV/MPV 最大直径比 ----------
+    sv_max = stat_features.get('sv_max_diameter')
+    mpv_max = stat_features.get('mpv_max_diameter')
+    out['sv_max_to_mpv_max_diam_ratio'] = _safe_div(sv_max, mpv_max)
+
+    # ---------- (2) MPV 主干长度 (alias, 训练侧不必再查 statistical) ----------
+    out['mpv_trunk_length_mm'] = stat_features.get('mpv_length')
+
+    # ---------- (3) 每段 tortuosity 聚合 ----------
+    tort_vals = []
+    for sn in ['mpv', 'sv', 'smv', 'lpv', 'rpv', 'lgv', 'pgv', 'tips']:
+        t = stat_features.get(f"{sn}_tortuosity")
+        # tortuosity 在 extract_features 里被转为 arc/chord (≥1); inf 表示退化
+        if t is not None and np.isfinite(t):
+            tort_vals.append(float(t))
+    if tort_vals:
+        out['max_tortuosity_index'] = float(np.max(tort_vals))
+        out['mean_tortuosity_index'] = float(np.mean(tort_vals))
+    else:
+        out['max_tortuosity_index'] = None
+        out['mean_tortuosity_index'] = None
+
+    # ---------- (4) 代偿血管最大直径 (替代易噪的 n_collaterals) ----------
+    collat_max = []
+    for cn in ['lgv', 'pgv']:
+        d = stat_features.get(f"{cn}_max_diameter")
+        if d is not None:
+            collat_max.append(float(d))
+    # 即使段缺失也输出 0.0 (而非 None) — 这是个明确的"无侧支"信号,
+    # 训练侧不需要再做 missing 处理
+    out['max_collateral_diameter_mm'] = (
+        float(np.max(collat_max)) if collat_max else 0.0)
+
+    # ---------- (5) MPV 分叉面积守恒偏离 ----------
+    # 直接复用 (B) 的 mpv_bifurc_area_ratio: 偏差 = |ratio − 1|
+    bifurc_ratio = None
+    a_mpv = stat_features.get('mpv_mean_area')
+    a_lpv = stat_features.get('lpv_mean_area')
+    a_rpv = stat_features.get('rpv_mean_area')
+    if a_mpv and a_lpv and a_rpv:
+        # 文档形式: (A_lpv+A_rpv)/A_mpv, 完美守恒 ≈ 1
+        bifurc_ratio = (a_lpv + a_rpv) / a_mpv
+    out['area_conservation_bifurc_deviation'] = (
+        abs(bifurc_ratio - 1.0) if bifurc_ratio is not None else None)
+
+    # ---------- (6) TIPS 工程参数 ----------
+    # 支架是金属管, mean_diameter 即支架名义直径
+    tips_info = seg_dict.get('tips')
+    if tips_info is not None:
+        out['tips_stent_diameter_mm'] = stat_features.get('tips_mean_diameter')
+        out['tips_stent_length_mm'] = stat_features.get('tips_length')
+    else:
+        out['tips_stent_diameter_mm'] = None
+        out['tips_stent_length_mm'] = None
+
+    # ---------- (7-8) PVT 严重程度 + 最窄/最宽面积比 (MPV) ----------
+    pw_mpv = _seg_pointwise(profile_data, 'mpv')
+    pvt_grade = None
+    min_max_ratio = None
+    if pw_mpv is not None:
+        # solidity (端点 NaN 已掩码)
+        sol = np.asarray(pw_mpv.get('solidity', []), dtype=float)
+        sol_min = _nan_min(sol)
+        if sol_min is not None:
+            if sol_min > _PVT_SOLIDITY_NORMAL:
+                pvt_grade = 0
+            elif sol_min > _PVT_SOLIDITY_PARTIAL:
+                pvt_grade = 1
+            else:
+                pvt_grade = 2
+        # MPV 最小/最大面积比 (focal thrombus 时显著偏低)
+        a_arr = np.asarray(pw_mpv.get('area', []), dtype=float)
+        a_min, a_max = _nan_min(a_arr), _nan_max(a_arr)
+        if a_min is not None and a_max is not None and a_max > 1e-6:
+            min_max_ratio = a_min / a_max
+    out['pvt_severity_grade'] = pvt_grade
+    out['min_lumen_area_to_max_ratio_mpv'] = min_max_ratio
+
+    # ---------- (9) 海绵样变启发式 ----------
+    # 触发条件 (任一成立):
+    #   (a) MPV 缺失 (segment_vessels 没识别出 MPV)
+    #   (b) MPV max_diameter < 5mm 且有代偿侧支 (主干被替代为侧支网络)
+    #   (c) 全树分叉点密度 > 2 / cm (异常密集的迂曲网络)
+    flag = 0
+    if seg_dict.get('mpv') is None:
+        flag = 1
+    else:
+        if (mpv_max is not None and mpv_max < _CAVERNOUS_MPV_MAX_DIAM_MM
+                and out['max_collateral_diameter_mm'] > 0):
+            flag = 1
+        bp_density = topology_out.get('branchpoint_density_per_cm')
+        if bp_density is not None and bp_density > _CAVERNOUS_BPDENSITY_PER_CM:
+            flag = 1
+    out['cavernous_transformation_flag'] = int(flag)
+
+    return out
+
+
+# ============================================================
+# 主入口
+# ============================================================
+
 def compute_system_features(seg_dict, stat_features, profile_data,
                              nodes, branch_points=None):
     """
@@ -561,8 +697,12 @@ def compute_system_features(seg_dict, stat_features, profile_data,
     out.update(_diameter_ratio_features(stat_features))
     out.update(_length_tortuosity_features(seg_dict, stat_features, nodes))
     out.update(_hydraulic_features(stat_features, profile_data))
-    out.update(_topology_features(
-        seg_dict, stat_features, profile_data, branch_points))
+    topology_out = _topology_features(
+        seg_dict, stat_features, profile_data, branch_points)
+    out.update(topology_out)
+    # (F) 临床派生标量 — 依赖 topology_out 的 branchpoint_density_per_cm
+    out.update(_clinical_summary_features(
+        seg_dict, stat_features, profile_data, topology_out))
     return out
 
 
@@ -600,6 +740,16 @@ SYSTEM_FEATURE_NAMES = [
     'mpv_proximal_diameter', 'mpv_distal_diameter',
     'mpv_min_max_diameter_ratio',
     'tree_area_conservation_mean_dev',
+    # (F) 临床派生标量 (PVP_feature_extraction_recommendations.md 新增)
+    'sv_max_to_mpv_max_diam_ratio',
+    'mpv_trunk_length_mm',
+    'max_tortuosity_index', 'mean_tortuosity_index',
+    'max_collateral_diameter_mm',
+    'area_conservation_bifurc_deviation',
+    'tips_stent_diameter_mm', 'tips_stent_length_mm',
+    'pvt_severity_grade',
+    'min_lumen_area_to_max_ratio_mpv',
+    'cavernous_transformation_flag',
 ]
 
 # 每个系统特征的中文标签 (用于报告)
@@ -645,4 +795,16 @@ SYSTEM_FEATURE_LABELS_CN = {
     'mpv_distal_diameter': 'MPV远端直径',
     'mpv_min_max_diameter_ratio': 'MPV最小/最大直径',
     'tree_area_conservation_mean_dev': '树面积守恒偏离',
+    # (F) 临床派生标量
+    'sv_max_to_mpv_max_diam_ratio': 'SV/MPV最大直径比',
+    'mpv_trunk_length_mm': 'MPV主干长度',
+    'max_tortuosity_index': '最大段曲折度',
+    'mean_tortuosity_index': '平均段曲折度',
+    'max_collateral_diameter_mm': '侧支最大直径',
+    'area_conservation_bifurc_deviation': 'MPV分叉面积守恒偏离',
+    'tips_stent_diameter_mm': 'TIPS支架直径',
+    'tips_stent_length_mm': 'TIPS支架长度',
+    'pvt_severity_grade': 'PVT严重度等级',
+    'min_lumen_area_to_max_ratio_mpv': 'MPV最窄/最宽面积比',
+    'cavernous_transformation_flag': '海绵样变标志',
 }

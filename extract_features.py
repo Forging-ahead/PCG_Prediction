@@ -727,6 +727,16 @@ def build_unified_features(flat_features, pointwise_data, seg_data,
                     'mpv_proximal_diameter', 'mpv_distal_diameter',
                     'mpv_min_max_diameter_ratio',
                     'tree_area_conservation_mean_dev'],
+                'F_clinical': [
+                    'sv_max_to_mpv_max_diam_ratio',
+                    'mpv_trunk_length_mm',
+                    'max_tortuosity_index', 'mean_tortuosity_index',
+                    'max_collateral_diameter_mm',
+                    'area_conservation_bifurc_deviation',
+                    'tips_stent_diameter_mm', 'tips_stent_length_mm',
+                    'pvt_severity_grade',
+                    'min_lumen_area_to_max_ratio_mpv',
+                    'cavernous_transformation_flag'],
             },
             'labels_cn': SYSTEM_FEATURE_LABELS_CN,
         },
@@ -741,15 +751,39 @@ def build_unified_features(flat_features, pointwise_data, seg_data,
             'description': '逐点剖面 (重采样到 n_points), 含端点 NaN 掩码',
             'segments': list(pointwise_block.keys()),
             'feature_keys': ['position', 'arc_length_mm', 'total_length_mm',
-                             'area', 'eq_diameter', 'perimeter', 'circularity',
-                             'curvature', 'inscribed_radius',
+                             'area', 'eq_diameter', 'perimeter',
+                             'hydraulic_diameter',       # 4A/P, 非圆截面用
+                             'circularity',
+                             'solidity',                  # A / 凸包面积 (PVT)
+                             'r_insc_to_r_eq_ratio',      # 瓶颈程度
+                             'n_components',              # lumen 分量数
+                             'curvature',
+                             'torsion',                   # 中心线 3D 扭转
+                             'dA_ds_norm',                # 局部锥度
+                             'inscribed_radius',
                              'edge_margin_pct', 'edge_margin_mm',
                              'n_masked_endpoints', 'n_rejected_oversize',
                              'n_section_success'],
+            'channel_labels_cn': {
+                'area': '截面面积 mm²',
+                'eq_diameter': '等效直径 mm',
+                'perimeter': '截面周长 mm',
+                'hydraulic_diameter': '水力直径 4A/P (任意形状)',
+                'circularity': '圆度 4πA/P²',
+                'solidity': '凸包实心度 (PVT指标)',
+                'r_insc_to_r_eq_ratio': '内切/等效半径比 (瓶颈)',
+                'n_components': 'lumen 连通分量数',
+                'curvature': '曲率 1/mm',
+                'torsion': '挠率 1/mm (NaN 可信度)',
+                'dA_ds_norm': '面积归一化变化率 (1/mm)',
+                'inscribed_radius': '内切球半径 mm',
+            },
             'mask_explanation': (
-                'area / eq_diameter / perimeter / circularity / inscribed_radius '
-                '在端点保护带 (edge_margin_pct + edge_margin_mm) 内为 NaN; '
-                '另对超过内切直径×inscribed_factor 的截面也丢弃 (防止穿透到邻近血管).'
+                'area / eq_diameter / perimeter / circularity / hydraulic_diameter '
+                '/ solidity / r_insc_to_r_eq_ratio / n_components / dA_ds_norm '
+                '/ inscribed_radius 在端点保护带 (edge_margin_pct + edge_margin_mm) '
+                '内为 NaN; 另对超过内切直径×inscribed_factor 的截面也丢弃 '
+                '(防止穿透到邻近血管). torsion 在直线段曲率近 0 处为 NaN.'
             ),
         },
         'segments_meta': {

@@ -69,7 +69,8 @@ def _polygon_aspect_ratio(poly_coords):
 
 
 def _section_one(mesh, point, normal, max_eq_diameter=None,
-                 return_ring=False, return_metrics=False):
+                 return_ring=False, return_metrics=False,
+                 return_extras=False):
     """
     用一个法线做截面, 返回截面几何 + 形状质量指标。
 
@@ -83,6 +84,13 @@ def _section_one(mesh, point, normal, max_eq_diameter=None,
       - aspect_ratio: PCA 长短轴比. 1.0 = 圆/正方; >4 通常是沿管轴薄片切或跨血管.
       - circularity:  4πA/P². 1.0 = 完美圆; <0.3 形状极不规则.
 
+    额外形状感知量 (return_extras=True, 用于 PVT / 血栓识别):
+      - n_components: 切平面下"有效闭合多边形"个数. 正常血管 = 1;
+                      血栓把管腔从中间隔断 → 2+; 圆环形血栓 = 1 (仍连通).
+      - solidity:     所选多边形面积 / 其凸包面积 ∈ (0, 1].
+                      凸截面 (圆/椭圆) = 1; 月牙/凹缺口形 < 1; 越小代表
+                      凹缺口越深 (典型 PVT 边缘血栓).
+
     防止边界效应 (邻近血管"渗透"):
       若 max_eq_diameter (一般取 1.6 ~ 2 倍局部内切直径) 给定,
       且最终候选多边形的等效直径 > max_eq_diameter, 视为污染并丢弃.
@@ -91,14 +99,18 @@ def _section_one(mesh, point, normal, max_eq_diameter=None,
         max_eq_diameter: float 或 None — 等效直径上界 (mm)
         return_ring:     是否同时返回 2D 多边形轮廓 (用于可视化)
         return_metrics:  是否同时返回 (aspect_ratio, circularity)
+        return_extras:   是否同时返回 (n_components, solidity)
 
-    返回 (按 flag 组合):
+    返回 (按 flag 组合, extras 永远放在末尾, 不影响既有调用方):
         默认                                            (area, peri)
         return_metrics=True                             (area, peri, AR, circ)
         return_ring=True                                (area, peri, ring_2d)
         return_ring=True, return_metrics=True           (area, peri, AR, circ, ring_2d)
-        失败时各位置填 0/0/999/0/None
+        return_extras=True 时, 再追加 (n_components, solidity)
+        失败时各位置填 0/0/999/0/None/0/0
     """
+    base_fail = (0.0, 0.0)
+    extras_fail = (0, 0.0)
     if return_ring and return_metrics:
         fail = (0.0, 0.0, 999.0, 0.0, None)
     elif return_metrics:
@@ -106,7 +118,9 @@ def _section_one(mesh, point, normal, max_eq_diameter=None,
     elif return_ring:
         fail = (0.0, 0.0, None)
     else:
-        fail = (0.0, 0.0)
+        fail = base_fail
+    if return_extras:
+        fail = fail + extras_fail
 
     try:
         lines = trimesh.intersections.mesh_plane(
@@ -153,7 +167,11 @@ def _section_one(mesh, point, normal, max_eq_diameter=None,
             return fail
 
         center = SPoint(0.0, 0.0)
-        containing = [p for p in polys if p.is_valid and p.contains(center)]
+        # 有效"非微小"多边形 — 用于估计 lumen 连通分量数
+        # 阈值 0.1mm² 排除离散化产生的针状碎片
+        nontrivial = [p for p in polys
+                      if p.is_valid and p.area > 0.1]
+        containing = [p for p in nontrivial if p.contains(center)]
 
         if containing:
             best = min(containing, key=lambda p: p.area)
@@ -181,13 +199,37 @@ def _section_one(mesh, point, normal, max_eq_diameter=None,
             else:
                 circularity = 0.0
 
+        if return_extras:
+            # n_components: 切平面下"有效非微小"多边形数 (lumen 是否被血栓隔断)
+            # 不考虑跨血管 — 跨血管候选会在后续 shape filter 中被剔除
+            n_components = int(len(nontrivial)) if nontrivial else 1
+
+            # solidity: 所选多边形面积 / 其凸包面积
+            # 凸 (圆/椭圆) = 1.0; 月牙/凹缺口 < 1.0
+            solidity = 1.0
+            try:
+                from scipy.spatial import ConvexHull
+                ring_arr = np.asarray(ring_2d_list, dtype=float)
+                if len(ring_arr) >= 3 and ring_arr.shape[1] >= 2:
+                    hull = ConvexHull(ring_arr[:, :2])
+                    hull_area = float(hull.volume)  # 2D 下 .volume 即面积
+                    if hull_area > 1e-9:
+                        solidity = float(min(1.0, area / hull_area))
+            except Exception:
+                solidity = 1.0
+            extras_tuple = (n_components, solidity)
+
         if return_ring and return_metrics:
-            return area, peri, aspect_ratio, circularity, ring_2d_list
-        if return_metrics:
-            return area, peri, aspect_ratio, circularity
-        if return_ring:
-            return area, peri, ring_2d_list
-        return area, peri
+            base = (area, peri, aspect_ratio, circularity, ring_2d_list)
+        elif return_metrics:
+            base = (area, peri, aspect_ratio, circularity)
+        elif return_ring:
+            base = (area, peri, ring_2d_list)
+        else:
+            base = (area, peri)
+        if return_extras:
+            return base + extras_tuple
+        return base
 
     except Exception:
         return fail
@@ -229,7 +271,8 @@ def _compute_cross_section(mesh, point, normal,
                            max_eq_diameter=None,
                            max_aspect_ratio=4.0,
                            min_circularity=0.30,
-                           return_normal=False):
+                           return_normal=False,
+                           return_extras=False):
     """
     鲁棒截面: 扰动法线 → 形状硬过滤 → 综合评分选最佳.
 
@@ -250,21 +293,33 @@ def _compute_cross_section(mesh, point, normal,
         max_aspect_ratio:    硬剔除阈值, 默认 4.0.
         min_circularity:     硬剔除阈值, 默认 0.30.
         return_normal:       是否返回所选最佳法线 (供可视化复现).
+        return_extras:       是否额外返回 (n_components, solidity) — PVT/血栓
+                             形状指标. 见 _section_one 文档.
 
     返回:
-        (area, perimeter)              — return_normal=False
-        (area, perimeter, best_normal) — return_normal=True
+        默认                   : (area, perimeter)
+        return_normal=True     : (area, perimeter, best_normal)
+        return_extras=True     : 末尾追加 (n_components, solidity)
     """
     normal = normal / (np.linalg.norm(normal) + 1e-15)
     candidates = _generate_normal_candidates(normal, n_perturb, max_angle_deg)
 
     best_score = float('inf')
     best_area, best_peri, best_normal = 0.0, 0.0, normal
+    best_ncomp, best_solidity = 0, 0.0
     for n in candidates:
-        a, p, ar, circ = _section_one(
-            mesh, point, n,
-            max_eq_diameter=max_eq_diameter,
-            return_metrics=True)
+        if return_extras:
+            a, p, ar, circ, ncomp, sol = _section_one(
+                mesh, point, n,
+                max_eq_diameter=max_eq_diameter,
+                return_metrics=True,
+                return_extras=True)
+        else:
+            a, p, ar, circ = _section_one(
+                mesh, point, n,
+                max_eq_diameter=max_eq_diameter,
+                return_metrics=True)
+            ncomp, sol = 0, 0.0
         if a <= 0:
             continue
         # 形状硬过滤
@@ -274,16 +329,23 @@ def _compute_cross_section(mesh, point, normal,
         if score < best_score:
             best_score = score
             best_area, best_peri, best_normal = a, p, n
+            best_ncomp, best_solidity = ncomp, sol
 
     if best_score == float('inf'):
         # 所有候选均不合格 → 该点截面无效
+        base = (0.0, 0.0)
         if return_normal:
-            return 0.0, 0.0, normal
-        return 0.0, 0.0
+            base = base + (normal,)
+        if return_extras:
+            base = base + (0, 0.0)
+        return base
 
+    base = (best_area, best_peri)
     if return_normal:
-        return best_area, best_peri, best_normal
-    return best_area, best_peri
+        base = base + (best_normal,)
+    if return_extras:
+        base = base + (int(best_ncomp), float(best_solidity))
+    return base
 
 
 def _compute_tangents(coords, smooth_window=5):
@@ -439,6 +501,65 @@ def _remove_local_outliers(area, perimeter, eq_diameter,
     return area, perimeter, eq_diameter, n_removed
 
 
+def _torsion_sliding_window(coords, arc_length, smooth_sigma=2.0,
+                             min_curvature_for_torsion=1e-3):
+    """
+    Frenet-Serret 挠率 τ (1/mm), 描述中心线在 3D 空间的"扭转"程度.
+
+    曲率 κ 描述"弯不弯"; 挠率 τ 描述"扭不扭". 平面曲线 τ=0; 螺旋线 τ>0.
+    门静脉海绵样变 / 重度迂曲的代偿血管 → τ 显著升高.
+
+    公式 (对弧长 s 的导数):
+        τ = ((P' × P'') · P''') / |P' × P''|²
+
+    数值实现:
+      1. 用 Gaussian 平滑坐标 (σ=smooth_sigma 个点), 抑制离散噪声
+      2. np.gradient 对弧长求一/二/三阶导数
+      3. 直线段 (|P' × P''| 几乎 0, ≡ κ ≈ 0) 数值不稳定 → 置 NaN
+
+    参数:
+        coords:                    (N, 3) 中心线坐标
+        arc_length:                (N,) 累积弧长 (单调递增)
+        smooth_sigma:              坐标平滑核宽 (点数), 默认 2
+        min_curvature_for_torsion: 曲率低于此值的点上挠率置 NaN
+                                    (避免直线段的 0/0 数值噪声)
+
+    返回:
+        (N,) 挠率数组, 不可信处为 NaN.
+    """
+    N = len(coords)
+    if N < 5:
+        return np.full(N, np.nan)
+    try:
+        from scipy.ndimage import gaussian_filter1d
+        coords_s = gaussian_filter1d(coords, sigma=smooth_sigma,
+                                      axis=0, mode='nearest')
+    except Exception:
+        coords_s = np.asarray(coords, dtype=float)
+
+    s = np.asarray(arc_length, dtype=float)
+    # 弧长退化 (重复点) 时 np.gradient 会发散
+    if not np.all(np.diff(s) > 1e-8):
+        return np.full(N, np.nan)
+
+    p1 = np.gradient(coords_s, s, axis=0)
+    p2 = np.gradient(p1, s, axis=0)
+    p3 = np.gradient(p2, s, axis=0)
+
+    cross_12 = np.cross(p1, p2)                   # (N, 3)
+    denom = np.sum(cross_12 ** 2, axis=1)         # |P'×P''|²
+
+    numer = np.einsum('ij,ij->i', cross_12, p3)   # (P'×P'') · P'''
+    torsion = numer / (denom + 1e-12)
+
+    # 在曲率近 0 处, 数值不稳定 → NaN
+    curv = np.sqrt(np.maximum(denom, 0.0)) / (
+        np.linalg.norm(p1, axis=1) ** 3 + 1e-12)
+    bad = (curv < min_curvature_for_torsion) | ~np.isfinite(torsion)
+    torsion[bad] = np.nan
+    return torsion
+
+
 def _curvature_sliding_window(coords, window=7):
     """滑窗法离散曲率 (1/mm)"""
     N = len(coords)
@@ -517,6 +638,8 @@ def _extract_branch_raw_profile(branch_path, nodes, mesh,
 
     area = np.zeros(M)
     perimeter = np.zeros(M)
+    solidity = np.zeros(M)            # (新) area / convex_hull_area
+    n_components = np.zeros(M, dtype=np.int16)  # (新) lumen 连通分量数
 
     indices = list(range(0, M, section_step))
     if indices[-1] != M - 1:
@@ -528,10 +651,14 @@ def _extract_branch_raw_profile(branch_path, nodes, mesh,
         # 局部允许的截面等效直径上限: inscribed_factor × 内切直径
         r_loc = inscribed_radius[idx]
         max_eq_d = (2.0 * r_loc * inscribed_factor) if r_loc > 0.5 else None
-        a, p = _compute_cross_section(mesh, coords[idx], tangents[idx],
-                                       max_eq_diameter=max_eq_d)
+        a, p, ncomp, sol = _compute_cross_section(
+            mesh, coords[idx], tangents[idx],
+            max_eq_diameter=max_eq_d,
+            return_extras=True)
         area[idx] = a
         perimeter[idx] = p
+        solidity[idx] = sol
+        n_components[idx] = ncomp
         if a > 0:
             n_success += 1
         elif r_loc > 0.5:
@@ -559,11 +686,17 @@ def _extract_branch_raw_profile(branch_path, nodes, mesh,
     # 写回
     area[sampled_idx] = sampled_area
     perimeter[sampled_idx] = sampled_peri
+    # 同步: 被剔除的位置 (area=0) 把 solidity / n_components 也清掉, 防止
+    # 后续 resample 把无效残留传到 100 点输出.
+    zeroed = sampled_area <= 0
+    if np.any(zeroed):
+        solidity[sampled_idx[zeroed]] = 0.0
+        n_components[sampled_idx[zeroed]] = 0
 
     # 对跳过的点插值 (仅对成功截面插值, 0 值不插)
     if section_step > 1 and n_success >= 2:
         sampled_arc = arc_length[indices]
-        for arr in [area, perimeter]:
+        for arr in [area, perimeter, solidity]:
             sampled = arr[indices]
             valid = sampled > 0
             if np.sum(valid) >= 2:
@@ -579,15 +712,37 @@ def _extract_branch_raw_profile(branch_path, nodes, mesh,
     valid_mask = (area > 0) & (perimeter > 0)
     circularity[valid_mask] = (4.0 * np.pi * area[valid_mask]) / (perimeter[valid_mask] ** 2)
 
+    # ---- 形状/水力派生通道 ----
+    # 水力直径 D_h = 4 A / P (适用于任意非圆截面)
+    hydraulic_diameter = np.zeros(M)
+    hydraulic_diameter[valid_mask] = (4.0 * area[valid_mask]
+                                      / perimeter[valid_mask])
+    # 瓶颈比 = 2·r_inscribed / D_eq ∈ (0, 1]
+    # 圆形 ≈ 1; 月牙/血栓挤压 → << 1 (真实通道宽 比 乐观估计窄)
+    r_insc_to_r_eq_ratio = np.zeros(M)
+    eq_valid = eq_diameter > 1e-6
+    r_insc_to_r_eq_ratio[eq_valid] = np.clip(
+        (2.0 * inscribed_radius[eq_valid]) / eq_diameter[eq_valid],
+        0.0, 1.5)
+    # solidity 已经在采样点直接得到, 用 0 标记缺失. circularity 同步,
+    # 在 _resample_profile 里会按 area>0 做插值.
+
+    # 曲率 + 挠率 (中心线本身的几何, 不受截面有效性影响)
     curvature = _curvature_sliding_window(coords, curvature_window)
+    torsion = _torsion_sliding_window(coords, arc_length)
 
     return {
         'arc_length': arc_length,
         'area': area,
         'perimeter': perimeter,
         'eq_diameter': eq_diameter,
+        'hydraulic_diameter': hydraulic_diameter,
         'circularity': circularity,
+        'solidity': solidity,
+        'n_components': n_components.astype(float),  # 便于和其它通道共用插值
+        'r_insc_to_r_eq_ratio': r_insc_to_r_eq_ratio,
         'curvature': curvature,
+        'torsion': torsion,
         'inscribed_radius': inscribed_radius,
         '_n_sampled': len(indices),
         '_n_success': n_success,
@@ -637,9 +792,12 @@ def _apply_endpoint_mask(profile, edge_margin_pct=0.05,
     # 并集
     invalid_mask = pct_mask | mm_mask
 
-    # 标记的 keys (截面相关特征)
+    # 标记的 keys (截面相关特征 + 新增形状/水力派生)
     section_keys = ['area', 'perimeter', 'eq_diameter',
-                    'circularity', 'inscribed_radius']
+                    'circularity', 'inscribed_radius',
+                    'hydraulic_diameter', 'solidity',
+                    'r_insc_to_r_eq_ratio', 'n_components',
+                    'dA_ds_norm']
 
     n_masked = int(np.sum(invalid_mask))
     if n_masked > 0:
@@ -684,16 +842,24 @@ def _resample_profile(raw_profile, n_points=100):
         'n_section_success': raw_profile.get('_n_success', 0),
     }
 
-    # 哪些 key 需要"只用有效值插值"(截面计算的)
-    section_keys = {'area', 'perimeter', 'eq_diameter', 'circularity'}
+    # 哪些 key 需要"只用有效值插值"(截面计算的, 0 值代表缺失)
+    section_keys = {'area', 'perimeter', 'eq_diameter', 'circularity',
+                    'hydraulic_diameter', 'solidity'}
     # 哪些 key 直接用所有点(中心线本身的几何, 没有 0 值问题)
-    geometry_keys = {'curvature', 'inscribed_radius'}
+    geometry_keys = {'curvature', 'inscribed_radius', 'r_insc_to_r_eq_ratio'}
+    # 整数离散 (lumen 分量数), 用最近邻
+    integer_keys = {'n_components'}
+    # 含 NaN 的几何 (挠率), 单独处理 — NaN 不参与插值
+    nanable_keys = {'torsion'}
 
     # 用 area > 0 作为"截面成功"的掩码
     area_arr = np.asarray(raw_profile['area'])
     success_mask = area_arr > 0
 
-    for key in (section_keys | geometry_keys):
+    available_keys = section_keys | geometry_keys | integer_keys | nanable_keys
+    available_keys = {k for k in available_keys if k in raw_profile}
+
+    for key in available_keys:
         values = np.asarray(raw_profile[key])
         try:
             if key in section_keys:
@@ -710,6 +876,32 @@ def _resample_profile(raw_profile, n_points=100):
                     resampled = np.clip(f(t_uniform), 0, None)
                 else:
                     resampled = np.zeros(n_points)
+            elif key in integer_keys:
+                # 离散整数: 用最近邻插值 (取整) + 端点延拓
+                if np.sum(success_mask) >= 2:
+                    t_valid = t_raw[success_mask]
+                    v_valid = values[success_mask]
+                    mask = np.concatenate(([True], np.diff(t_valid) > 1e-10))
+                    t_c, v_c = t_valid[mask], v_valid[mask]
+                    f = interp1d(t_c, v_c, kind='nearest',
+                                 bounds_error=False,
+                                 fill_value=(v_c[0], v_c[-1]))
+                    resampled = np.clip(f(t_uniform), 0, None)
+                else:
+                    resampled = np.zeros(n_points)
+            elif key in nanable_keys:
+                # NaN-aware: 跳过 NaN 做线性插值, 不可信处仍保留 NaN
+                finite = np.isfinite(values)
+                if np.sum(finite) >= 2:
+                    t_c, v_c = t_raw[finite], values[finite]
+                    mask = np.concatenate(([True], np.diff(t_c) > 1e-10))
+                    t_c, v_c = t_c[mask], v_c[mask]
+                    f = interp1d(t_c, v_c, kind='linear',
+                                 bounds_error=False,
+                                 fill_value=np.nan)
+                    resampled = f(t_uniform)
+                else:
+                    resampled = np.full(n_points, np.nan)
             else:
                 # 中心线几何特征: 用所有原始点
                 mask = np.concatenate(([True], np.diff(t_raw) > 1e-10))
@@ -724,9 +916,32 @@ def _resample_profile(raw_profile, n_points=100):
 
             if key == 'circularity':
                 resampled = np.clip(resampled, 0, 1.5)
+            if key == 'solidity':
+                resampled = np.clip(resampled, 0, 1.0)
+            if key == 'r_insc_to_r_eq_ratio':
+                resampled = np.clip(resampled, 0, 1.5)
             result[key] = resampled.tolist()
         except Exception:
-            result[key] = [0.0] * n_points
+            result[key] = ([float('nan')] * n_points
+                           if key in nanable_keys else [0.0] * n_points)
+
+    # ---- dA/ds 归一化变化率 (沿重采样均匀点计算, 数值稳定) ----
+    try:
+        area_uniform = np.asarray(result.get('area', [0.0] * n_points),
+                                   dtype=float)
+        arc_uniform = np.asarray(result['arc_length_mm'], dtype=float)
+        if np.sum(area_uniform > 0) >= 3 and np.all(np.diff(arc_uniform) > 0):
+            grad = np.gradient(area_uniform, arc_uniform)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                dA_ds = grad / np.where(area_uniform > 1e-6,
+                                         area_uniform, np.nan)
+            # 缺失区段置 NaN, 不污染下游
+            dA_ds[area_uniform <= 0] = np.nan
+            result['dA_ds_norm'] = dA_ds.tolist()
+        else:
+            result['dA_ds_norm'] = [float('nan')] * n_points
+    except Exception:
+        result['dA_ds_norm'] = [float('nan')] * n_points
 
     return result
 
@@ -850,6 +1065,20 @@ def extract_profiles(stl_path, n_points=100, pitch=0.5,
         'n_total_rejected_oversize': int(n_total_rejected_oversize),
         'n_total_local_outliers': int(n_total_local_outliers),
         'n_total_rate_outliers': int(n_total_rate_outliers),
+        # 新增逐点通道清单 (便于训练侧统一索引)
+        'pointwise_channels': [
+            'position', 'arc_length_mm',
+            'area', 'perimeter', 'eq_diameter',
+            'hydraulic_diameter',        # 4A/P, 非圆截面有效直径
+            'circularity',
+            'solidity',                  # A / 凸包面积, ∈ (0,1], 1=凸
+            'r_insc_to_r_eq_ratio',      # 2r_insc / D_eq, 瓶颈程度
+            'n_components',              # lumen 分量数 (1=正常, 2+=被血栓隔断)
+            'curvature',
+            'torsion',                   # Frenet 挠率, 中心线 3D 扭转 (NaN 友好)
+            'dA_ds_norm',                # (dA/ds)/A, 局部锥度 (NaN 友好)
+            'inscribed_radius',
+        ],
     }
 
     out_path = os.path.join(parentdir, "centerline_pointwise_profiles.json")
