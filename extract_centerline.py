@@ -145,6 +145,24 @@ def extract_centerline(stl_path, output_txt_path=None,
         output_txt_path = os.path.join(parentdir, "CenterlinePoints.txt")
     save_tree(centerline_tree, output_txt_path)
 
+    # ---- 缓存一致性保护 ----
+    # 下游 utils.load_tree() 默认优先读 newCenterlist.txt. 如果用户:
+    #   1) 调了剪枝参数, 2) 重跑 Step 1, 3) 没重跑 Step 2 (clean_old=False
+    #   或 smooth_centerline 关闭), 旧的 newCenterlist.txt 会"屏蔽"新结果,
+    #   导致下游/可视化与新参数完全脱节. 这里主动把过期的平滑文件干掉,
+    #   保证 load_tree() 必然落到刚写的 CenterlinePoints.txt 上.
+    stale_smooth = os.path.join(os.path.dirname(output_txt_path),
+                                 "newCenterlist.txt")
+    if os.path.exists(stale_smooth):
+        try:
+            os.remove(stale_smooth)
+            if verbose:
+                print(f"       已清理过期平滑文件: {stale_smooth} "
+                      f"(避免下游读到旧中心线)")
+        except Exception as e:
+            if verbose:
+                print(f"       [warn] 无法删除 {stale_smooth}: {e}")
+
     n_ep = sum(1 for r in centerline_tree if r[5] == -1 and r[6] == -1)
     n_br = sum(1 for r in centerline_tree if r[5] != -1 and r[6] != -1)
     if verbose:
