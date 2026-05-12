@@ -166,6 +166,7 @@ def _process_one_patient(stl_path, post_tips, params, steps):
                 pitch=params['pitch'],
                 curvature_window=params['curvature_window'],
                 section_step=params['sample_step'],
+                ownership_factor=params['ownership_factor'],
                 max_diameter_rate_per_mm=params[
                     'max_diameter_rate_per_mm'])
             print(f"  [Step 5] 剖面特征: {time.time()-t0:.2f}s")
@@ -372,6 +373,8 @@ DEFAULT_PARAMS = {
     'n_profile_points': 100,
     'curvature_window': 7,
     'sample_step': 3,
+    'ownership_factor': 1.8,        # 中心线锚定最大内切半径裁剪倍数:
+                                     # clean_area = raw_section ∩ circle(c, k*r_anchor)
     'max_diameter_rate_per_mm': 0.5,  # 沿管轴等效直径相对变化率上限 (1/mm)
                                        # 0.5 = 每 mm 最多 50% 变化, 超阈孤立
                                        # 点视为单点突变伪影

@@ -68,9 +68,61 @@ def _polygon_aspect_ratio(poly_coords):
     return float(np.sqrt(eigvals[1] / eigvals[0]))
 
 
+def _pick_polygon_from_geometry(geom, center):
+    """从 Polygon/MultiPolygon 中选中心线锚点所属的主多边形。"""
+    if geom is None or geom.is_empty:
+        return None
+    if geom.geom_type == 'Polygon':
+        return geom if geom.is_valid and geom.area > 0 else None
+    if not hasattr(geom, 'geoms'):
+        return None
+
+    polys = [g for g in geom.geoms
+             if getattr(g, 'geom_type', None) == 'Polygon'
+             and g.is_valid and g.area > 0]
+    if not polys:
+        return None
+
+    containing = [p for p in polys if p.covers(center)]
+    if containing:
+        return max(containing, key=lambda p: p.area)
+    return min(polys, key=lambda p: p.distance(center))
+
+
+def _center_owned_polygon(poly, center, ownership_factor=1.8):
+    """
+    用中心线锚定的最大内切半径裁剪截面。
+
+    r_anchor 是中心点到截面边界的最短距离。限制圆半径取
+    ownership_factor * r_anchor: 圆形血管不受影响, 椭圆血管保留主体,
+    分叉污染向外伸出的区域会被裁掉。
+    """
+    if poly is None or poly.is_empty or not poly.is_valid:
+        return None, 0.0, 0.0
+
+    if ownership_factor is None or ownership_factor <= 0:
+        return poly, 0.0, 0.0
+
+    if not poly.covers(center):
+        return poly, 0.0, 0.0
+
+    anchor_radius = float(poly.boundary.distance(center))
+    if anchor_radius <= 1e-6:
+        return poly, anchor_radius, 0.0
+
+    owned_radius = float(anchor_radius * ownership_factor)
+    limiter = center.buffer(owned_radius, resolution=64)
+    owned_geom = poly.intersection(limiter)
+    owned_poly = _pick_polygon_from_geometry(owned_geom, center)
+    if owned_poly is None or owned_poly.area <= 1e-9:
+        return poly, anchor_radius, owned_radius
+    return owned_poly, anchor_radius, owned_radius
+
+
 def _section_one(mesh, point, normal, max_eq_diameter=None,
+                 ownership_factor=1.8,
                  return_ring=False, return_metrics=False,
-                 return_extras=False):
+                 return_raw=False, return_extras=False):
     """
     用一个法线做截面, 返回截面几何 + 形状质量指标。
 
@@ -91,14 +143,22 @@ def _section_one(mesh, point, normal, max_eq_diameter=None,
                       凸截面 (圆/椭圆) = 1; 月牙/凹缺口形 < 1; 越小代表
                       凹缺口越深 (典型 PVT 边缘血栓).
 
+    中心线锚定清洗:
+      先取真实截面多边形 P, 再用当前中心线投影点 (0,0) 到 P 边界的
+      最短距离作为锚定内切半径 r_anchor。最终用于面积统计的是
+      P ∩ circle((0,0), ownership_factor·r_anchor)。这能保留当前血管
+      主体, 同时裁掉分叉/汇合处伸向邻近血管的污染区域。
+
     防止边界效应 (邻近血管"渗透"):
       若 max_eq_diameter (一般取 1.6 ~ 2 倍局部内切直径) 给定,
-      且最终候选多边形的等效直径 > max_eq_diameter, 视为污染并丢弃.
+      且清洗后候选多边形的等效直径 > max_eq_diameter, 视为污染并丢弃.
 
     参数:
         max_eq_diameter: float 或 None — 等效直径上界 (mm)
+        ownership_factor: 中心锚定裁剪圆半径 / 锚定内切半径, 默认 1.8
         return_ring:     是否同时返回 2D 多边形轮廓 (用于可视化)
         return_metrics:  是否同时返回 (aspect_ratio, circularity)
+        return_raw:      是否追加原始未裁剪的 area/perimeter 与锚定半径
         return_extras:   是否同时返回 (n_components, solidity)
 
     返回 (按 flag 组合, extras 永远放在末尾, 不影响既有调用方):
@@ -106,7 +166,8 @@ def _section_one(mesh, point, normal, max_eq_diameter=None,
         return_metrics=True                             (area, peri, AR, circ)
         return_ring=True                                (area, peri, ring_2d)
         return_ring=True, return_metrics=True           (area, peri, AR, circ, ring_2d)
-        return_extras=True 时, 再追加 (n_components, solidity)
+        return_raw=True 时, 再追加 (raw_area, raw_peri, anchor_r, owned_r)
+        return_extras=True 时, 最后追加 (n_components, solidity)
         失败时各位置填 0/0/999/0/None/0/0
     """
     base_fail = (0.0, 0.0)
@@ -119,6 +180,8 @@ def _section_one(mesh, point, normal, max_eq_diameter=None,
         fail = (0.0, 0.0, None)
     else:
         fail = base_fail
+    if return_raw:
+        fail = fail + (0.0, 0.0, 0.0, 0.0)
     if return_extras:
         fail = fail + extras_fail
 
@@ -181,8 +244,16 @@ def _section_one(mesh, point, normal, max_eq_diameter=None,
                 return fail
             best = min(valid_polys, key=lambda p: p.distance(center))
 
-        area = float(best.area)
-        peri = float(best.exterior.length)
+        raw_area = float(best.area)
+        raw_peri = float(best.exterior.length)
+
+        owned, anchor_radius, owned_radius = _center_owned_polygon(
+            best, center, ownership_factor=ownership_factor)
+        if owned is None:
+            return fail
+
+        area = float(owned.area)
+        peri = float(owned.exterior.length)
 
         # 边界效应保护: 若给了内切直径上界, 直接拒绝越界候选
         if max_eq_diameter is not None and area > 0:
@@ -191,9 +262,10 @@ def _section_one(mesh, point, normal, max_eq_diameter=None,
                 return fail
 
         # 形状指标
-        ring_2d_list = list(best.exterior.coords)
+        raw_ring_2d_list = list(best.exterior.coords)
+        owned_ring_2d_list = list(owned.exterior.coords)
         if return_metrics:
-            aspect_ratio = _polygon_aspect_ratio(ring_2d_list)
+            aspect_ratio = _polygon_aspect_ratio(owned_ring_2d_list)
             if peri > 1e-6:
                 circularity = float(min(1.5, 4.0 * np.pi * area / (peri * peri)))
             else:
@@ -209,7 +281,7 @@ def _section_one(mesh, point, normal, max_eq_diameter=None,
             solidity = 1.0
             try:
                 from scipy.spatial import ConvexHull
-                ring_arr = np.asarray(ring_2d_list, dtype=float)
+                ring_arr = np.asarray(owned_ring_2d_list, dtype=float)
                 if len(ring_arr) >= 3 and ring_arr.shape[1] >= 2:
                     hull = ConvexHull(ring_arr[:, :2])
                     hull_area = float(hull.volume)  # 2D 下 .volume 即面积
@@ -220,13 +292,15 @@ def _section_one(mesh, point, normal, max_eq_diameter=None,
             extras_tuple = (n_components, solidity)
 
         if return_ring and return_metrics:
-            base = (area, peri, aspect_ratio, circularity, ring_2d_list)
+            base = (area, peri, aspect_ratio, circularity, raw_ring_2d_list)
         elif return_metrics:
             base = (area, peri, aspect_ratio, circularity)
         elif return_ring:
-            base = (area, peri, ring_2d_list)
+            base = (area, peri, raw_ring_2d_list)
         else:
             base = (area, peri)
+        if return_raw:
+            base = base + (raw_area, raw_peri, anchor_radius, owned_radius)
         if return_extras:
             return base + extras_tuple
         return base
@@ -269,9 +343,11 @@ def _shape_score(area, aspect_ratio, circularity):
 def _compute_cross_section(mesh, point, normal,
                            n_perturb=12, max_angle_deg=15,
                            max_eq_diameter=None,
+                           ownership_factor=1.8,
                            max_aspect_ratio=4.0,
                            min_circularity=0.30,
                            return_normal=False,
+                           return_raw=False,
                            return_extras=False):
     """
     鲁棒截面: 扰动法线 → 形状硬过滤 → 综合评分选最佳.
@@ -290,15 +366,18 @@ def _compute_cross_section(mesh, point, normal,
 
     参数:
         max_eq_diameter:     等效直径上界 (mm), 默认 None 不限.
+        ownership_factor:    中心线锚定裁剪圆半径 / 锚定内切半径.
         max_aspect_ratio:    硬剔除阈值, 默认 4.0.
         min_circularity:     硬剔除阈值, 默认 0.30.
         return_normal:       是否返回所选最佳法线 (供可视化复现).
+        return_raw:          是否追加原始未裁剪 area/perimeter 与锚定半径.
         return_extras:       是否额外返回 (n_components, solidity) — PVT/血栓
                              形状指标. 见 _section_one 文档.
 
     返回:
         默认                   : (area, perimeter)
         return_normal=True     : (area, perimeter, best_normal)
+        return_raw=True        : 追加 (raw_area, raw_perimeter, anchor_radius, owned_radius)
         return_extras=True     : 末尾追加 (n_components, solidity)
     """
     normal = normal / (np.linalg.norm(normal) + 1e-15)
@@ -306,19 +385,42 @@ def _compute_cross_section(mesh, point, normal,
 
     best_score = float('inf')
     best_area, best_peri, best_normal = 0.0, 0.0, normal
+    best_raw_area, best_raw_peri = 0.0, 0.0
+    best_anchor_radius, best_owned_radius = 0.0, 0.0
     best_ncomp, best_solidity = 0, 0.0
     for n in candidates:
         if return_extras:
-            a, p, ar, circ, ncomp, sol = _section_one(
-                mesh, point, n,
-                max_eq_diameter=max_eq_diameter,
-                return_metrics=True,
-                return_extras=True)
+            if return_raw:
+                a, p, ar, circ, raw_a, raw_p, anchor_r, owned_r, ncomp, sol = _section_one(
+                    mesh, point, n,
+                    max_eq_diameter=max_eq_diameter,
+                    ownership_factor=ownership_factor,
+                    return_metrics=True,
+                    return_raw=True,
+                    return_extras=True)
+            else:
+                a, p, ar, circ, ncomp, sol = _section_one(
+                    mesh, point, n,
+                    max_eq_diameter=max_eq_diameter,
+                    ownership_factor=ownership_factor,
+                    return_metrics=True,
+                    return_extras=True)
+                raw_a, raw_p, anchor_r, owned_r = a, p, 0.0, 0.0
         else:
-            a, p, ar, circ = _section_one(
-                mesh, point, n,
-                max_eq_diameter=max_eq_diameter,
-                return_metrics=True)
+            if return_raw:
+                a, p, ar, circ, raw_a, raw_p, anchor_r, owned_r = _section_one(
+                    mesh, point, n,
+                    max_eq_diameter=max_eq_diameter,
+                    ownership_factor=ownership_factor,
+                    return_metrics=True,
+                    return_raw=True)
+            else:
+                a, p, ar, circ = _section_one(
+                    mesh, point, n,
+                    max_eq_diameter=max_eq_diameter,
+                    ownership_factor=ownership_factor,
+                    return_metrics=True)
+                raw_a, raw_p, anchor_r, owned_r = a, p, 0.0, 0.0
             ncomp, sol = 0, 0.0
         if a <= 0:
             continue
@@ -329,6 +431,8 @@ def _compute_cross_section(mesh, point, normal,
         if score < best_score:
             best_score = score
             best_area, best_peri, best_normal = a, p, n
+            best_raw_area, best_raw_peri = raw_a, raw_p
+            best_anchor_radius, best_owned_radius = anchor_r, owned_r
             best_ncomp, best_solidity = ncomp, sol
 
     if best_score == float('inf'):
@@ -336,6 +440,8 @@ def _compute_cross_section(mesh, point, normal,
         base = (0.0, 0.0)
         if return_normal:
             base = base + (normal,)
+        if return_raw:
+            base = base + (0.0, 0.0, 0.0, 0.0)
         if return_extras:
             base = base + (0, 0.0)
         return base
@@ -343,6 +449,9 @@ def _compute_cross_section(mesh, point, normal,
     base = (best_area, best_peri)
     if return_normal:
         base = base + (best_normal,)
+    if return_raw:
+        base = base + (best_raw_area, best_raw_peri,
+                       best_anchor_radius, best_owned_radius)
     if return_extras:
         base = base + (int(best_ncomp), float(best_solidity))
     return base
@@ -607,6 +716,7 @@ def _extract_branch_raw_profile(branch_path, nodes, mesh,
                                 dt=None, origin=None, pitch=None,
                                 curvature_window=7, section_step=1,
                                 inscribed_factor=1.8,
+                                ownership_factor=1.8,
                                 max_diameter_rate_per_mm=0.5):
     """
     沿一段中心线提取逐点剖面.
@@ -615,6 +725,10 @@ def _extract_branch_raw_profile(branch_path, nodes, mesh,
         越界则该位置截面记为 0 (后续会变 NaN).
         默认 1.8: 真实截面通常 1.0~1.4 倍 (圆形=1, 椭圆稍大).
         分叉点处穿透到邻近血管时, 比值会显著 > 2.
+
+    ownership_factor: 中心线锚定清洗半径倍数.
+        clean_area = raw_section ∩ circle(center, ownership_factor*r_anchor).
+        默认 1.8, 保留椭圆主体并裁掉分叉污染外伸区域.
 
     max_diameter_rate_per_mm: 沿管轴允许的等效直径相对变化率 (1/mm).
         超过此速率的孤立点视为伪影 (单点塌陷/膨胀), 见 _remove_rate_outliers.
@@ -636,8 +750,12 @@ def _extract_branch_raw_profile(branch_path, nodes, mesh,
     # ---- 内切半径 (来自 STL 表面距离, 用于边界效应过滤) ----
     inscribed_radius = _compute_inscribed_radius_per_point(coords, mesh)
 
-    area = np.zeros(M)
-    perimeter = np.zeros(M)
+    area = np.zeros(M)           # clean/owned area, downstream default
+    perimeter = np.zeros(M)      # clean/owned perimeter
+    raw_area = np.zeros(M)       # original STL section before owned clipping
+    raw_perimeter = np.zeros(M)
+    anchor_radius = np.zeros(M)
+    owned_radius = np.zeros(M)
     solidity = np.zeros(M)            # (新) area / convex_hull_area
     n_components = np.zeros(M, dtype=np.int16)  # (新) lumen 连通分量数
 
@@ -651,12 +769,18 @@ def _extract_branch_raw_profile(branch_path, nodes, mesh,
         # 局部允许的截面等效直径上限: inscribed_factor × 内切直径
         r_loc = inscribed_radius[idx]
         max_eq_d = (2.0 * r_loc * inscribed_factor) if r_loc > 0.5 else None
-        a, p, ncomp, sol = _compute_cross_section(
+        a, p, raw_a, raw_p, anchor_r, owned_r, ncomp, sol = _compute_cross_section(
             mesh, coords[idx], tangents[idx],
             max_eq_diameter=max_eq_d,
+            ownership_factor=ownership_factor,
+            return_raw=True,
             return_extras=True)
         area[idx] = a
         perimeter[idx] = p
+        raw_area[idx] = raw_a
+        raw_perimeter[idx] = raw_p
+        anchor_radius[idx] = anchor_r
+        owned_radius[idx] = owned_r
         solidity[idx] = sol
         n_components[idx] = ncomp
         if a > 0:
@@ -690,13 +814,18 @@ def _extract_branch_raw_profile(branch_path, nodes, mesh,
     # 后续 resample 把无效残留传到 100 点输出.
     zeroed = sampled_area <= 0
     if np.any(zeroed):
+        raw_area[sampled_idx[zeroed]] = 0.0
+        raw_perimeter[sampled_idx[zeroed]] = 0.0
+        anchor_radius[sampled_idx[zeroed]] = 0.0
+        owned_radius[sampled_idx[zeroed]] = 0.0
         solidity[sampled_idx[zeroed]] = 0.0
         n_components[sampled_idx[zeroed]] = 0
 
     # 对跳过的点插值 (仅对成功截面插值, 0 值不插)
     if section_step > 1 and n_success >= 2:
         sampled_arc = arc_length[indices]
-        for arr in [area, perimeter, solidity]:
+        for arr in [area, perimeter, raw_area, raw_perimeter,
+                    anchor_radius, owned_radius, solidity]:
             sampled = arr[indices]
             valid = sampled > 0
             if np.sum(valid) >= 2:
@@ -707,6 +836,8 @@ def _extract_branch_raw_profile(branch_path, nodes, mesh,
 
     eq_diameter = np.sqrt(4.0 * area / np.pi)
     eq_diameter[area <= 0] = 0.0
+    raw_eq_diameter = np.sqrt(4.0 * raw_area / np.pi)
+    raw_eq_diameter[raw_area <= 0] = 0.0
 
     circularity = np.zeros(M)
     valid_mask = (area > 0) & (perimeter > 0)
@@ -736,6 +867,11 @@ def _extract_branch_raw_profile(branch_path, nodes, mesh,
         'area': area,
         'perimeter': perimeter,
         'eq_diameter': eq_diameter,
+        'raw_area': raw_area,
+        'raw_perimeter': raw_perimeter,
+        'raw_eq_diameter': raw_eq_diameter,
+        'anchor_radius': anchor_radius,
+        'owned_radius': owned_radius,
         'hydraulic_diameter': hydraulic_diameter,
         'circularity': circularity,
         'solidity': solidity,
@@ -794,6 +930,8 @@ def _apply_endpoint_mask(profile, edge_margin_pct=0.05,
 
     # 标记的 keys (截面相关特征 + 新增形状/水力派生)
     section_keys = ['area', 'perimeter', 'eq_diameter',
+                    'raw_area', 'raw_perimeter', 'raw_eq_diameter',
+                    'anchor_radius', 'owned_radius',
                     'circularity', 'inscribed_radius',
                     'hydraulic_diameter', 'solidity',
                     'r_insc_to_r_eq_ratio', 'n_components',
@@ -844,7 +982,9 @@ def _resample_profile(raw_profile, n_points=100):
 
     # 哪些 key 需要"只用有效值插值"(截面计算的, 0 值代表缺失)
     section_keys = {'area', 'perimeter', 'eq_diameter', 'circularity',
-                    'hydraulic_diameter', 'solidity'}
+                    'hydraulic_diameter', 'solidity',
+                    'raw_area', 'raw_perimeter', 'raw_eq_diameter',
+                    'anchor_radius', 'owned_radius'}
     # 哪些 key 直接用所有点(中心线本身的几何, 没有 0 值问题)
     geometry_keys = {'curvature', 'inscribed_radius', 'r_insc_to_r_eq_ratio'}
     # 整数离散 (lumen 分量数), 用最近邻
@@ -953,6 +1093,7 @@ def extract_profiles(stl_path, n_points=100, pitch=0.5,
                      edge_margin_pct=0.05,
                      edge_margin_mm=8.0,
                      inscribed_factor=1.8,
+                     ownership_factor=1.8,
                      max_diameter_rate_per_mm=0.5):
     """
     为每个解剖段提取 100 点剖面 (含截面特征)。
@@ -970,6 +1111,8 @@ def extract_profiles(stl_path, n_points=100, pitch=0.5,
         edge_margin_mm:    端点保护绝对距离 mm (默认 8.0)
         inscribed_factor:  截面等效直径相对于内切直径 (2*r) 的最大允许倍数
                            (默认 1.8). 用于过滤穿透到邻近血管的"超大"截面.
+        ownership_factor:  中心线锚定清洗半径倍数 (默认 1.8).
+                           用于保留当前血管主体并裁剪分叉污染区域.
         max_diameter_rate_per_mm: 沿管轴允许的等效直径相对变化率 (1/mm),
                                   默认 0.5 = 每 mm 最多 50% 相对变化.
                                   超阈孤立点视为伪影截面 (单点塌陷/膨胀).
@@ -1010,6 +1153,7 @@ def extract_profiles(stl_path, n_points=100, pitch=0.5,
                 curvature_window=curvature_window,
                 section_step=section_step,
                 inscribed_factor=inscribed_factor,
+                ownership_factor=ownership_factor,
                 max_diameter_rate_per_mm=max_diameter_rate_per_mm)
 
             if raw_profile is None:
@@ -1060,6 +1204,7 @@ def extract_profiles(stl_path, n_points=100, pitch=0.5,
         'edge_margin_pct': float(edge_margin_pct),
         'edge_margin_mm': float(edge_margin_mm),
         'inscribed_factor': float(inscribed_factor),
+        'ownership_factor': float(ownership_factor),
         'max_diameter_rate_per_mm': float(max_diameter_rate_per_mm),
         'n_total_masked': int(n_total_masked),
         'n_total_rejected_oversize': int(n_total_rejected_oversize),
@@ -1069,6 +1214,8 @@ def extract_profiles(stl_path, n_points=100, pitch=0.5,
         'pointwise_channels': [
             'position', 'arc_length_mm',
             'area', 'perimeter', 'eq_diameter',
+            'raw_area', 'raw_perimeter', 'raw_eq_diameter',
+            'anchor_radius', 'owned_radius',
             'hydraulic_diameter',        # 4A/P, 非圆截面有效直径
             'circularity',
             'solidity',                  # A / 凸包面积, ∈ (0,1], 1=凸

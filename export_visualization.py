@@ -287,6 +287,15 @@ def _find_max_section(profile, edge_margin=0.05):
         'eq_diameter': float(profile['eq_diameter'][idx]),
         'perimeter': float(profile['perimeter'][idx])
                      if 'perimeter' in profile else 0.0,
+        'raw_area': float(profile['raw_area'][idx])
+                    if 'raw_area' in profile else float(areas[idx]),
+        'raw_eq_diameter': float(profile['raw_eq_diameter'][idx])
+                           if 'raw_eq_diameter' in profile
+                           else float(profile['eq_diameter'][idx]),
+        'anchor_radius': float(profile['anchor_radius'][idx])
+                         if 'anchor_radius' in profile else None,
+        'owned_radius': float(profile['owned_radius'][idx])
+                        if 'owned_radius' in profile else None,
         'position_pct': idx,
     }
 def _interp_centerline_at_pos(seg_path, nodes, pos_idx, n_total=100):
@@ -487,22 +496,26 @@ def _build_max_section_traces(seg_data, pointwise_profiles, nodes, stl_mesh):
                 x=ring_3d[:, 0], y=ring_3d[:, 1], z=ring_3d[:, 2],
                 mode='lines',
                 line=dict(color=color, width=10),  # 加粗
-                name=f"{label} max-section (A={max_info['area']:.1f}mm²)",
+                name=f"{label} max-section (Aclean={max_info['area']:.1f}mm²)",
                 legendgroup=f'maxsec_{seg_name}',
                 showlegend=True,
                 hovertemplate=(
                     f"<b>{label} 最大截面 (真实)</b><br>"
                     f"位置: {max_info['position_pct']}%<br>"
-                    f"面积: {max_info['area']:.2f} mm²<br>"
+                    f"清洗面积: {max_info['area']:.2f} mm²<br>"
+                    f"原始面积: {max_info['raw_area']:.2f} mm²<br>"
                     f"周长: {max_info['perimeter']:.2f} mm<br>"
                     f"等效直径: {max_info['eq_diameter']:.2f} mm"
                     "<extra></extra>"),
             ))
             print(f"      [{label}] @ {max_info['position_pct']}%, "
-                  f"A={max_info['area']:.2f}mm², 真实轮廓 {len(ring_3d)} 点 ✓")
+                  f"Aclean={max_info['area']:.2f}mm², "
+                  f"Araw={max_info['raw_area']:.2f}mm², "
+                  f"真实轮廓 {len(ring_3d)} 点 ✓")
         else:
             print(f"      [{label}] @ {max_info['position_pct']}%, "
-                  f"A={max_info['area']:.2f}mm², 真实轮廓计算失败 ✗")
+                  f"Aclean={max_info['area']:.2f}mm², "
+                  f"真实轮廓计算失败 ✗")
 
         # ---- 等效圆 (粗虚线) ----
         eq_radius = max_info['eq_diameter'] / 2.0
@@ -536,7 +549,8 @@ def _build_max_section_traces(seg_data, pointwise_profiles, nodes, stl_mesh):
             hovertemplate=(
                 f"<b>{label} 最大截面位置</b><br>"
                 f"沿段位置: {max_info['position_pct']}%<br>"
-                f"截面积: {max_info['area']:.2f} mm²<br>"
+                f"清洗截面积: {max_info['area']:.2f} mm²<br>"
+                f"原始截面积: {max_info['raw_area']:.2f} mm²<br>"
                 f"等效直径: {max_info['eq_diameter']:.2f} mm<br>"
                 f"坐标: ({point[0]:.1f}, {point[1]:.1f}, {point[2]:.1f})"
                 "<extra></extra>"),
@@ -552,8 +566,7 @@ def _build_max_section_traces(seg_data, pointwise_profiles, nodes, stl_mesh):
         traces.append(go.Scatter3d(
             x=[text_pos[0]], y=[text_pos[1]], z=[text_pos[2]],
             mode='text',
-            text=[f"<b style='background-color:white;padding:2px'>"
-                  f"{label}: A={max_info['area']:.1f}mm²</b>"],
+            text=[f"{label}: Aclean={max_info['area']:.1f}mm²"],
             textposition='middle center',
             textfont=dict(size=12, color=color, family='Arial Black'),
             name=f"{label} max text",
@@ -653,8 +666,13 @@ def _build_figure(stl_path):
             if pointwise and pointwise.get(nm):
                 ms = _find_max_section(pointwise[nm])
                 if ms:
-                    line += (f"  Amax={ms['area']:.1f}mm² "
-                             f"(@{ms['position_pct']}%)")
+                    if ms.get('raw_area') is not None:
+                        line += (f"  Amax={ms['area']:.1f}mm² "
+                                 f"(raw={ms['raw_area']:.1f}, "
+                                 f"@{ms['position_pct']}%)")
+                    else:
+                        line += (f"  Amax={ms['area']:.1f}mm² "
+                                 f"(@{ms['position_pct']}%)")
             info_lines.append(line)
     info_html = "<br>".join(info_lines) if info_lines else ""
 
