@@ -7,6 +7,10 @@
       → BFS建树
 
 新增剪枝策略:
+  (0) **保护门 (新)**: 末端分支最大半径 / 父主干半径 ≥ keep_radius_ratio
+       → 视为真实分支, 跳过所有长度/相对长度判据.
+       目的: 避免短-但-粗 的真实小分支被长度阈值误剪
+       (Murray 定律下子血管半径 ≈ 0.6~0.8 × 父血管, 远高于噪声毛刺 0.1~0.2)
   (1) 物理长度阈值: 末端分支弧长 < min_branch_length_mm 剪除
   (2) 相对长度阈值: 末端分支弧长 < total_length × min_relative_length 剪除
   (3) 半径判据: 末端分支最大半径 < 父主干半径 × min_radius_ratio 剪除
@@ -31,6 +35,7 @@ def extract_centerline(stl_path, output_txt_path=None,
                        min_branch_length_mm=8.0,
                        min_relative_length=0.05,
                        min_radius_ratio=0.4,
+                       keep_radius_ratio=0.55,
                        merge_bp_distance_mm=5.0,
                        max_prune_iterations=20,
                        verbose=True):
@@ -48,6 +53,11 @@ def extract_centerline(stl_path, output_txt_path=None,
         min_radius_ratio:       末端分支最大半径 / 主干半径 的最小比例
                                 小于此比例的末端分支视为表面凸起剪除
                                 (区分真细血管 vs 表面凸起)
+        keep_radius_ratio:      "保护门"阈值. 末端分支最大半径 / 主干半径
+                                ≥ 该值时, 跳过所有长度判据直接保留.
+                                目的: 保护短-但-粗 的真实分支 (常见于
+                                LPV/RPV/LGV/PGV 末端). 默认 0.55:
+                                noise spur 通常 < 0.3, 真分支多在 0.6+.
         merge_bp_distance_mm:   两个分支点距离小于此值时合并
         max_prune_iterations:   剪枝最大迭代次数
         verbose:                打印进度
@@ -96,6 +106,7 @@ def extract_centerline(stl_path, output_txt_path=None,
         min_branch_length_mm=min_branch_length_mm,
         min_relative_length=min_relative_length,
         min_radius_ratio=min_radius_ratio,
+        keep_radius_ratio=keep_radius_ratio,
         merge_bp_distance_mm=merge_bp_distance_mm,
         max_iterations=max_prune_iterations,
         verbose=verbose)
@@ -173,6 +184,7 @@ def _enhanced_prune(G, id_to_point, id_to_radius, pitch,
                     min_branch_length_mm,
                     min_relative_length,
                     min_radius_ratio,
+                    keep_radius_ratio,
                     merge_bp_distance_mm,
                     max_iterations,
                     verbose):
@@ -181,13 +193,15 @@ def _enhanced_prune(G, id_to_point, id_to_radius, pitch,
 
     每轮:
       a) 找所有末端分支(从端点沿度=2 节点走到下一个度!=2 节点)
-      b) 评估剪枝条件
-      c) 剪掉满足任一条件的分支
+      b) **保护门**: 若分支最大半径 / 主干半径 ≥ keep_radius_ratio,
+                     视为真实分支, 跳过该轮所有剪枝判据
+      c) 剪掉满足任一长度/半径判据的分支
       d) 合并近邻分支点
     直到稳定或达到最大迭代。
     """
     n_pruned_total = 0
     n_merged_total = 0
+    n_kept_thick_total = 0
 
     # 先估计总长度作为相对长度参考
     total_edge_length = sum(d['weight'] for _, _, d in G.edges(data=True))
@@ -198,6 +212,7 @@ def _enhanced_prune(G, id_to_point, id_to_radius, pitch,
             break
 
         n_pruned_this_round = 0
+        n_kept_thick_this_round = 0
         prune_logs = []
 
         for ep in list(endpoints):
@@ -219,6 +234,15 @@ def _enhanced_prune(G, id_to_point, id_to_radius, pitch,
 
             # 父主干半径(取分支点处的半径)
             junction_radius = id_to_radius[junction]
+
+            # ---- 保护门: 半径占比足够大 → 视为真实分支, 不剪 ----
+            # 即使分支较短, 只要其管径相对于分叉处足够粗, 物理上不可能是
+            # 表面噪声毛刺 (skeletonization spur 的 r_max 通常 ≤ 1~2 个体素),
+            # 真分支应当保留以免后续解剖分段缺失.
+            if (junction_radius > 1e-6 and
+                    branch_max_radius / junction_radius >= keep_radius_ratio):
+                n_kept_thick_this_round += 1
+                continue
 
             # 三个判据
             should_prune = False
@@ -254,19 +278,23 @@ def _enhanced_prune(G, id_to_point, id_to_radius, pitch,
 
         n_pruned_total += n_pruned_this_round
         n_merged_total += n_merged
+        n_kept_thick_total += n_kept_thick_this_round
 
         if verbose and (n_pruned_this_round > 0 or n_merged > 0):
             sample = ("; ".join(prune_logs[:3]) +
                       ("..." if len(prune_logs) > 3 else ""))
+            kept_note = (f", 保护粗分支 {n_kept_thick_this_round}"
+                         if n_kept_thick_this_round > 0 else "")
             print(f"       iter {iteration+1}: 剪除{n_pruned_this_round}点, "
-                  f"合并bp{n_merged}个  例: {sample}")
+                  f"合并bp{n_merged}个{kept_note}  例: {sample}")
 
         if n_pruned_this_round == 0 and n_merged == 0:
             break
 
     if verbose:
         print(f"       剪枝合计: 移除 {n_pruned_total} 点, "
-              f"合并 {n_merged_total} 个 bp")
+              f"合并 {n_merged_total} 个 bp, "
+              f"保护粗分支 {n_kept_thick_total} 次")
     return G
 
 

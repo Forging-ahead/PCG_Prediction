@@ -309,6 +309,77 @@ def _compute_tangents(coords, smooth_window=5):
     return tangents
 
 
+def _remove_rate_outliers(area, perimeter, eq_diameter, arc_length,
+                          max_rate_per_mm=0.5):
+    """
+    沿管轴"变化速率"过滤: 真实血管的直径沿管轴是缓变的, 哪怕在缩窄/狭窄处,
+    每 mm 的相对直径变化也很少超过 50% (max_rate_per_mm=0.5).
+    单点出现急剧塌陷/急剧膨胀 → 截面渗透到邻近血管 / 沿轴薄片切 / 分叉伪影.
+
+    判定: 对每个有效采样点 i, 找其最近的左右有效邻居 j ∈ {prev, next},
+    计算相对变化率
+        r_j = |D[i] − D[j]| / (mean_D · Δs_ij)        单位 1/mm
+    - 若两侧邻居均给出 r_j > max_rate_per_mm → 孤立尖峰, 剔除
+    - 若只有一侧邻居 (段端), 该侧 r_j > 2·max_rate_per_mm 才剔除
+      (段端单边判据更严, 避免误伤端点处的真实收口)
+
+    与 `_remove_local_outliers` (MAD) 互补:
+      MAD : 适合捕捉与"局部分布"显著偏离的点 (含成簇异常)
+      rate: 适合捕捉单点"突变 / 阶梯", 含图像 2.png / 3.png 中 MPV 沿轴
+            单点截面塌陷 (大血管中突现 1.8mm² 极小值) 这类伪影.
+
+    参数:
+        max_rate_per_mm: 允许的相对直径变化率上限 (1/mm), 默认 0.5
+
+    返回:
+        (area, perimeter, eq_diameter, n_removed) — 原地修改
+    """
+    M = len(area)
+    if M < 3 or max_rate_per_mm <= 0:
+        return area, perimeter, eq_diameter, 0
+
+    valid = eq_diameter > 0
+    valid_idx = np.where(valid)[0]
+    if len(valid_idx) < 3:
+        return area, perimeter, eq_diameter, 0
+
+    flagged = np.zeros(M, dtype=bool)
+
+    for k, i in enumerate(valid_idx):
+        rates = []
+        neighbors = []
+        if k > 0:
+            neighbors.append(valid_idx[k - 1])
+        if k < len(valid_idx) - 1:
+            neighbors.append(valid_idx[k + 1])
+        for j in neighbors:
+            ds = abs(arc_length[i] - arc_length[j])
+            if ds < 1e-6:
+                continue
+            mean_d = 0.5 * (eq_diameter[i] + eq_diameter[j])
+            if mean_d < 1e-6:
+                continue
+            rates.append(abs(eq_diameter[i] - eq_diameter[j]) / (mean_d * ds))
+
+        if not rates:
+            continue
+        if len(rates) >= 2:
+            # 两侧都有邻居: 两侧均超阈才剔除 (剔除孤立尖峰)
+            if all(r > max_rate_per_mm for r in rates):
+                flagged[i] = True
+        else:
+            # 段端单边: 阈值加倍, 更保守
+            if rates[0] > 2.0 * max_rate_per_mm:
+                flagged[i] = True
+
+    n_removed = int(np.sum(flagged))
+    if n_removed > 0:
+        area[flagged] = 0.0
+        perimeter[flagged] = 0.0
+        eq_diameter[flagged] = 0.0
+    return area, perimeter, eq_diameter, n_removed
+
+
 def _remove_local_outliers(area, perimeter, eq_diameter,
                            window=15, mad_factor=3.5):
     """
@@ -414,7 +485,8 @@ def _compute_inscribed_radius_per_point(coords, mesh):
 def _extract_branch_raw_profile(branch_path, nodes, mesh,
                                 dt=None, origin=None, pitch=None,
                                 curvature_window=7, section_step=1,
-                                inscribed_factor=1.8):
+                                inscribed_factor=1.8,
+                                max_diameter_rate_per_mm=0.5):
     """
     沿一段中心线提取逐点剖面.
 
@@ -422,6 +494,10 @@ def _extract_branch_raw_profile(branch_path, nodes, mesh,
         越界则该位置截面记为 0 (后续会变 NaN).
         默认 1.8: 真实截面通常 1.0~1.4 倍 (圆形=1, 椭圆稍大).
         分叉点处穿透到邻近血管时, 比值会显著 > 2.
+
+    max_diameter_rate_per_mm: 沿管轴允许的等效直径相对变化率 (1/mm).
+        超过此速率的孤立点视为伪影 (单点塌陷/膨胀), 见 _remove_rate_outliers.
+        默认 0.5 = 每 mm 最多 50% 相对变化.
 
     返回: dict (含原始 area/eq_diameter/inscribed_radius/...) 或 None.
     """
@@ -469,10 +545,17 @@ def _extract_branch_raw_profile(branch_path, nodes, mesh,
     sampled_peri = perimeter[sampled_idx].copy()
     sampled_eq = np.sqrt(4.0 * sampled_area / np.pi)
     sampled_eq[sampled_area <= 0] = 0.0
+    sampled_arc = arc_length[sampled_idx]
 
+    # (1) MAD 局部异常 (与局部分布偏离)
     sampled_area, sampled_peri, sampled_eq, n_outliers = \
         _remove_local_outliers(sampled_area, sampled_peri, sampled_eq,
                                window=15, mad_factor=3.5)
+    # (2) 沿管轴变化速率过滤 (单点突变/塌陷, 与 MAD 互补)
+    sampled_area, sampled_peri, sampled_eq, n_rate_outliers = \
+        _remove_rate_outliers(sampled_area, sampled_peri, sampled_eq,
+                              sampled_arc,
+                              max_rate_per_mm=max_diameter_rate_per_mm)
     # 写回
     area[sampled_idx] = sampled_area
     perimeter[sampled_idx] = sampled_peri
@@ -510,6 +593,7 @@ def _extract_branch_raw_profile(branch_path, nodes, mesh,
         '_n_success': n_success,
         '_n_rejected_oversize': n_rejected,
         '_n_local_outliers': int(n_outliers),
+        '_n_rate_outliers': int(n_rate_outliers),
     }
 
 
@@ -653,7 +737,8 @@ def extract_profiles(stl_path, n_points=100, pitch=0.5,
                      curvature_window=7, section_step=3,
                      edge_margin_pct=0.05,
                      edge_margin_mm=8.0,
-                     inscribed_factor=1.8):
+                     inscribed_factor=1.8,
+                     max_diameter_rate_per_mm=0.5):
     """
     为每个解剖段提取 100 点剖面 (含截面特征)。
 
@@ -670,6 +755,9 @@ def extract_profiles(stl_path, n_points=100, pitch=0.5,
         edge_margin_mm:    端点保护绝对距离 mm (默认 8.0)
         inscribed_factor:  截面等效直径相对于内切直径 (2*r) 的最大允许倍数
                            (默认 1.8). 用于过滤穿透到邻近血管的"超大"截面.
+        max_diameter_rate_per_mm: 沿管轴允许的等效直径相对变化率 (1/mm),
+                                  默认 0.5 = 每 mm 最多 50% 相对变化.
+                                  超阈孤立点视为伪影截面 (单点塌陷/膨胀).
     """
     parentdir = os.path.dirname(stl_path)
     seg_path = os.path.join(parentdir, "centerline_profiles.json")
@@ -693,6 +781,7 @@ def extract_profiles(stl_path, n_points=100, pitch=0.5,
     n_total_masked = 0
     n_total_rejected_oversize = 0
     n_total_local_outliers = 0
+    n_total_rate_outliers = 0
 
     for seg_name, seg_info in seg_data['segments'].items():
         if seg_info is None:
@@ -705,7 +794,8 @@ def extract_profiles(stl_path, n_points=100, pitch=0.5,
                 seg_info['path'], nodes, mesh,
                 curvature_window=curvature_window,
                 section_step=section_step,
-                inscribed_factor=inscribed_factor)
+                inscribed_factor=inscribed_factor,
+                max_diameter_rate_per_mm=max_diameter_rate_per_mm)
 
             if raw_profile is None:
                 profiles[seg_name] = None
@@ -715,6 +805,8 @@ def extract_profiles(stl_path, n_points=100, pitch=0.5,
                 '_n_rejected_oversize', 0)
             n_total_local_outliers += raw_profile.get(
                 '_n_local_outliers', 0)
+            n_total_rate_outliers += raw_profile.get(
+                '_n_rate_outliers', 0)
 
             # 重采样到 n_points
             resampled = _resample_profile(raw_profile, n_points=n_points)
@@ -733,6 +825,8 @@ def extract_profiles(stl_path, n_points=100, pitch=0.5,
                 raw_profile.get('_n_rejected_oversize', 0))
             resampled['n_local_outliers'] = int(
                 raw_profile.get('_n_local_outliers', 0))
+            resampled['n_rate_outliers'] = int(
+                raw_profile.get('_n_rate_outliers', 0))
             resampled['n_section_success'] = int(
                 raw_profile.get('_n_success', 0))
 
@@ -751,9 +845,11 @@ def extract_profiles(stl_path, n_points=100, pitch=0.5,
         'edge_margin_pct': float(edge_margin_pct),
         'edge_margin_mm': float(edge_margin_mm),
         'inscribed_factor': float(inscribed_factor),
+        'max_diameter_rate_per_mm': float(max_diameter_rate_per_mm),
         'n_total_masked': int(n_total_masked),
         'n_total_rejected_oversize': int(n_total_rejected_oversize),
         'n_total_local_outliers': int(n_total_local_outliers),
+        'n_total_rate_outliers': int(n_total_rate_outliers),
     }
 
     out_path = os.path.join(parentdir, "centerline_pointwise_profiles.json")
@@ -765,7 +861,8 @@ def extract_profiles(stl_path, n_points=100, pitch=0.5,
     print(f"  剖面提取完成: {len(valid_segs)} 个段, "
           f"端点掩码 {n_total_masked} 处, "
           f"形状/内切超限剔除 {n_total_rejected_oversize} 处, "
-          f"局部异常剔除 {n_total_local_outliers} 处")
+          f"局部异常剔除 {n_total_local_outliers} 处, "
+          f"变化率剔除 {n_total_rate_outliers} 处")
     return profiles
 
 def _diagnose_centerline_mesh(branch_path, nodes, mesh):

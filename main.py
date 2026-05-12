@@ -97,6 +97,7 @@ def _process_one_patient(stl_path, post_tips, params, steps):
                 min_branch_length_mm=params['min_branch_length_mm'],
                 min_relative_length=params['min_relative_length'],
                 min_radius_ratio=params['min_radius_ratio'],
+                keep_radius_ratio=params['keep_radius_ratio'],
                 merge_bp_distance_mm=params['merge_bp_distance_mm'])
             print(f"  [Step 1] 中心线提取: {time.time()-t0:.2f}s")
             status['centerline'] = True
@@ -161,7 +162,9 @@ def _process_one_patient(stl_path, post_tips, params, steps):
                 n_points=params['n_profile_points'],
                 pitch=params['pitch'],
                 curvature_window=params['curvature_window'],
-                section_step=params['sample_step'])
+                section_step=params['sample_step'],
+                max_diameter_rate_per_mm=params[
+                    'max_diameter_rate_per_mm'])
             print(f"  [Step 5] 剖面特征: {time.time()-t0:.2f}s")
             status['profiles'] = True
         except Exception as e:
@@ -353,6 +356,8 @@ DEFAULT_PARAMS = {
     'min_branch_length_mm': 8.0,
     'min_relative_length': 0.05,
     'min_radius_ratio': 0.4,
+    'keep_radius_ratio': 0.55,       # 保护门: r_branch/r_junction ≥ 0.55 时
+                                      # 视为真分支, 跳过所有长度判据
     'merge_bp_distance_mm': 5.0,
 
     # 特征 / 剖面
@@ -360,6 +365,9 @@ DEFAULT_PARAMS = {
     'n_profile_points': 100,
     'curvature_window': 7,
     'sample_step': 3,
+    'max_diameter_rate_per_mm': 0.5,  # 沿管轴等效直径相对变化率上限 (1/mm)
+                                       # 0.5 = 每 mm 最多 50% 变化, 超阈孤立
+                                       # 点视为单点突变伪影
 }
 
 
