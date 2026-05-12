@@ -1,0 +1,454 @@
+"""
+中心线提取模块（STL输入版 v2 - 增强剪枝）
+==========================================
+流程:
+  STL → 体素化 → 距离变换 → 3D骨架化(Lee94) → 图构建
+      → 增强剪枝(物理长度+半径判据+近邻分支点合并)
+      → BFS建树
+
+新增剪枝策略:
+  (1) 物理长度阈值: 末端分支弧长 < min_branch_length_mm 剪除
+  (2) 相对长度阈值: 末端分支弧长 < total_length × min_relative_length 剪除
+  (3) 半径判据: 末端分支最大半径 < 父主干半径 × min_radius_ratio 剪除
+  (4) 近邻 bp 合并: 两个 bp 距离 < merge_bp_distance_mm 时合并
+  (5) 迭代到稳定
+
+依赖: numpy, trimesh, scipy, scikit-image, networkx
+"""
+
+import os
+import numpy as np
+from scipy import ndimage
+from skimage.morphology import skeletonize as skeletonize_3d
+import networkx as nx
+from collections import deque
+
+from utils import voxelize_stl, voxel_to_physical, save_tree
+
+
+def extract_centerline(stl_path, output_txt_path=None,
+                       pitch=0.5,
+                       min_branch_length_mm=8.0,
+                       min_relative_length=0.05,
+                       min_radius_ratio=0.4,
+                       merge_bp_distance_mm=5.0,
+                       max_prune_iterations=20,
+                       verbose=True):
+    """
+    从STL文件提取中心线 (含增强剪枝)。
+
+    参数:
+        stl_path:               STL 文件路径
+        output_txt_path:        输出路径, 默认 CenterlinePoints.txt
+        pitch:                  体素化分辨率(mm)
+        min_branch_length_mm:   末端分支最小物理长度阈值(mm)
+                                小于此值的末端分支被视为噪声剪除
+        min_relative_length:    末端分支相对总长度的最小比例
+                                小于此比例的末端分支也被剪除
+        min_radius_ratio:       末端分支最大半径 / 主干半径 的最小比例
+                                小于此比例的末端分支视为表面凸起剪除
+                                (区分真细血管 vs 表面凸起)
+        merge_bp_distance_mm:   两个分支点距离小于此值时合并
+        max_prune_iterations:   剪枝最大迭代次数
+        verbose:                打印进度
+
+    返回:
+        centerline_tree: list of [ID, x, y, z, parentID, leftChildID, rightChildID]
+    """
+    if verbose:
+        print(f"\n[1/6] 体素化STL: {os.path.basename(stl_path)}")
+    binary, origin, pitch = voxelize_stl(stl_path, pitch)
+    if np.sum(binary) == 0:
+        raise ValueError("体素化结果为空")
+
+    if verbose:
+        print("[2/6] 距离变换...")
+    dist_map = ndimage.distance_transform_edt(binary, sampling=pitch)
+
+    if verbose:
+        print("[3/6] 3D骨架化 (Lee94)...")
+    skeleton = skeletonize_3d(binary).astype(np.uint8)
+    skel_points = np.argwhere(skeleton > 0)
+    if verbose:
+        print(f"       骨架点: {len(skel_points)}")
+    if len(skel_points) == 0:
+        raise ValueError("骨架化结果为空")
+
+    if verbose:
+        print("[4/6] 构建骨架图...")
+    G, id_to_point, id_to_radius = _build_skeleton_graph(
+        skel_points, dist_map, pitch)
+
+    components = list(nx.connected_components(G))
+    if len(components) > 1:
+        if verbose:
+            print(f"       {len(components)} 个连通分量, 保留最大的")
+        largest_cc = max(components, key=len)
+        G = G.subgraph(largest_cc).copy()
+    if verbose:
+        print(f"       图节点数: {G.number_of_nodes()}")
+
+    if verbose:
+        print(f"[5/6] 增强剪枝 (min_L={min_branch_length_mm}mm, "
+              f"radius_ratio={min_radius_ratio})...")
+    G = _enhanced_prune(
+        G, id_to_point, id_to_radius, pitch,
+        min_branch_length_mm=min_branch_length_mm,
+        min_relative_length=min_relative_length,
+        min_radius_ratio=min_radius_ratio,
+        merge_bp_distance_mm=merge_bp_distance_mm,
+        max_iterations=max_prune_iterations,
+        verbose=verbose)
+
+    if verbose:
+        print(f"       剪枝后节点数: {G.number_of_nodes()}")
+        eps = sum(1 for n in G.nodes() if G.degree(n) == 1)
+        bps = sum(1 for n in G.nodes() if G.degree(n) >= 3)
+        print(f"       端点: {eps}, 分支点: {bps}")
+
+    # ----- 第6步: BFS 建树, 输出物理坐标 -----
+    if verbose:
+        print("[6/6] BFS建树...")
+    centerline_tree = _build_tree_from_graph(
+        G, id_to_point, dist_map, origin, pitch)
+
+    if output_txt_path is None:
+        parentdir = os.path.dirname(stl_path)
+        output_txt_path = os.path.join(parentdir, "CenterlinePoints.txt")
+    save_tree(centerline_tree, output_txt_path)
+
+    n_ep = sum(1 for r in centerline_tree if r[5] == -1 and r[6] == -1)
+    n_br = sum(1 for r in centerline_tree if r[5] != -1 and r[6] != -1)
+    if verbose:
+        print(f"       总点数: {len(centerline_tree)}, 端点: {n_ep}, "
+              f"分支点: {n_br}")
+        print(f"       已保存: {output_txt_path}")
+
+    return centerline_tree
+
+
+# ============================================================
+# 骨架图构建（带半径信息）
+# ============================================================
+
+def _build_skeleton_graph(skel_points, dist_map, pitch):
+    """
+    构建 26 邻域骨架图。
+    每个节点附带 radius (来自距离变换, mm)。
+    """
+    skel_set = set(map(tuple, skel_points))
+    point_to_id = {}
+    id_to_point = {}
+    id_to_radius = {}
+    for idx, pt in enumerate(skel_points):
+        key = tuple(pt)
+        point_to_id[key] = idx
+        id_to_point[idx] = key
+        id_to_radius[idx] = float(dist_map[pt[0], pt[1], pt[2]])
+
+    offsets = [(di, dj, dk)
+               for di in [-1, 0, 1] for dj in [-1, 0, 1] for dk in [-1, 0, 1]
+               if not (di == 0 and dj == 0 and dk == 0)]
+
+    G = nx.Graph()
+    G.add_nodes_from(range(len(skel_points)))
+    for idx, pt in enumerate(skel_points):
+        i, j, k = pt
+        for di, dj, dk in offsets:
+            neighbor = (i + di, j + dj, k + dk)
+            if neighbor in skel_set:
+                nid = point_to_id[neighbor]
+                if nid > idx:
+                    w = pitch * np.sqrt(di**2 + dj**2 + dk**2)
+                    G.add_edge(idx, nid, weight=w)
+
+    return G, id_to_point, id_to_radius
+
+
+# ============================================================
+# 增强剪枝
+# ============================================================
+
+def _enhanced_prune(G, id_to_point, id_to_radius, pitch,
+                    min_branch_length_mm,
+                    min_relative_length,
+                    min_radius_ratio,
+                    merge_bp_distance_mm,
+                    max_iterations,
+                    verbose):
+    """
+    迭代式增强剪枝。
+
+    每轮:
+      a) 找所有末端分支(从端点沿度=2 节点走到下一个度!=2 节点)
+      b) 评估剪枝条件
+      c) 剪掉满足任一条件的分支
+      d) 合并近邻分支点
+    直到稳定或达到最大迭代。
+    """
+    n_pruned_total = 0
+    n_merged_total = 0
+
+    # 先估计总长度作为相对长度参考
+    total_edge_length = sum(d['weight'] for _, _, d in G.edges(data=True))
+
+    for iteration in range(max_iterations):
+        endpoints = [n for n in G.nodes() if G.degree(n) == 1]
+        if not endpoints:
+            break
+
+        n_pruned_this_round = 0
+        prune_logs = []
+
+        for ep in list(endpoints):
+            if ep not in G or G.degree(ep) != 1:
+                continue  # 已被前面剪掉
+
+            branch_path, junction = _trace_branch_from_endpoint(G, ep)
+            if branch_path is None or junction is None:
+                continue
+            if G.degree(junction) < 3:
+                continue  # 不是真分支点, 不剪
+
+            # 物理弧长
+            branch_length = _path_arc_length(G, branch_path)
+
+            # 末端分支最大半径
+            branch_max_radius = max(
+                id_to_radius[n] for n in branch_path)
+
+            # 父主干半径(取分支点处的半径)
+            junction_radius = id_to_radius[junction]
+
+            # 三个判据
+            should_prune = False
+            reason = ""
+
+            if branch_length < min_branch_length_mm:
+                should_prune = True
+                reason = f"短(L={branch_length:.1f}mm)"
+            elif branch_length < total_edge_length * min_relative_length:
+                should_prune = True
+                reason = (f"相对短(L={branch_length:.1f}mm < "
+                          f"{100*min_relative_length:.0f}%)")
+            elif (junction_radius > 1e-6 and
+                  branch_max_radius / junction_radius < min_radius_ratio):
+                should_prune = True
+                reason = (f"细(r_branch={branch_max_radius:.2f}mm, "
+                          f"r_junction={junction_radius:.2f}mm, "
+                          f"ratio={branch_max_radius/junction_radius:.2f})")
+
+            if should_prune:
+                # 剪除分支(不剪 junction 本身)
+                for n in branch_path:
+                    if n != junction and n in G:
+                        G.remove_node(n)
+                        n_pruned_this_round += 1
+                if verbose and len(prune_logs) < 5:
+                    prune_logs.append(reason)
+
+        # 合并近邻分支点
+        n_merged = _merge_nearby_branchpoints(
+            G, id_to_point, id_to_radius, pitch,
+            merge_bp_distance_mm)
+
+        n_pruned_total += n_pruned_this_round
+        n_merged_total += n_merged
+
+        if verbose and (n_pruned_this_round > 0 or n_merged > 0):
+            sample = ("; ".join(prune_logs[:3]) +
+                      ("..." if len(prune_logs) > 3 else ""))
+            print(f"       iter {iteration+1}: 剪除{n_pruned_this_round}点, "
+                  f"合并bp{n_merged}个  例: {sample}")
+
+        if n_pruned_this_round == 0 and n_merged == 0:
+            break
+
+    if verbose:
+        print(f"       剪枝合计: 移除 {n_pruned_total} 点, "
+              f"合并 {n_merged_total} 个 bp")
+    return G
+
+
+def _trace_branch_from_endpoint(G, endpoint):
+    """
+    从一个端点沿度=2 节点走, 直到遇到度!=2 节点(分支点或另一端点)。
+
+    返回:
+        path:     [endpoint, ..., last_deg2_node, junction]
+                  (含 junction)
+        junction: 分支点 ID
+        若找不到合适路径, 返回 (None, None)
+    """
+    if G.degree(endpoint) != 1:
+        return None, None
+
+    path = [endpoint]
+    prev = None
+    current = endpoint
+    visited = {endpoint}
+    while True:
+        neighbors = [n for n in G.neighbors(current) if n != prev]
+        if len(neighbors) != 1:
+            break
+        nxt = neighbors[0]
+        if nxt in visited:
+            break
+        path.append(nxt)
+        visited.add(nxt)
+        if G.degree(nxt) != 2:
+            return path, nxt
+        prev = current
+        current = nxt
+
+    return None, None
+
+
+def _path_arc_length(G, path):
+    """计算 path 的物理弧长, 使用图边权重。"""
+    L = 0.0
+    for i in range(len(path) - 1):
+        if G.has_edge(path[i], path[i + 1]):
+            L += G[path[i]][path[i + 1]]['weight']
+    return L
+
+
+def _merge_nearby_branchpoints(G, id_to_point, id_to_radius, pitch,
+                                merge_distance_mm):
+    """
+    合并距离极近的两个分支点。
+
+    若两个分支点 bp1, bp2 在图中通过 ≤ merge_distance_mm 的路径相连,
+    且都是真 bp (度≥3), 把 bp2 的所有邻居改接到 bp1, 删除 bp2。
+    """
+    if merge_distance_mm <= 0:
+        return 0
+
+    n_merged = 0
+    bps = [n for n in G.nodes() if G.degree(n) >= 3]
+    bps_set = set(bps)
+
+    for bp1 in list(bps):
+        if bp1 not in G or G.degree(bp1) < 3:
+            continue
+        # 找 bp1 附近 (BFS, 按弧长 ≤ merge_distance_mm) 的另一个 bp
+        merged_one = False
+        visited = {bp1: 0.0}
+        queue = deque([(bp1, 0.0)])
+        while queue:
+            cur, dist = queue.popleft()
+            if dist > merge_distance_mm:
+                continue
+            if cur != bp1 and cur in bps_set and G.degree(cur) >= 3:
+                # 合并 cur 到 bp1
+                _merge_two_bps(G, bp1, cur)
+                bps_set.discard(cur)
+                n_merged += 1
+                merged_one = True
+                break
+            for nb in G.neighbors(cur):
+                w = G[cur][nb]['weight']
+                if nb not in visited or dist + w < visited[nb]:
+                    visited[nb] = dist + w
+                    if dist + w <= merge_distance_mm:
+                        queue.append((nb, dist + w))
+        if merged_one:
+            # 重新检查 bp1, 可能还有更多近邻 bp
+            continue
+
+    return n_merged
+
+
+def _merge_two_bps(G, keep, drop):
+    """
+    把 drop 的所有邻居重接到 keep, 删除 drop 及 keep-drop 之间的桥接路径。
+
+    实际操作:
+      - 找 keep → drop 的最短路径 (理论上很短)
+      - 删除路径上 keep 和 drop 之间所有中间节点 + drop
+      - 把 drop 的非桥接邻居挂到 keep
+    """
+    if keep == drop or drop not in G or keep not in G:
+        return
+
+    # 找 keep -> drop 路径
+    try:
+        path = nx.shortest_path(G, keep, drop, weight='weight')
+    except nx.NetworkXNoPath:
+        return
+
+    # drop 在原图的邻居 (非桥接路径上的)
+    drop_neighbors = list(G.neighbors(drop))
+    bridge_set = set(path)
+
+    external_neighbors = [n for n in drop_neighbors if n not in bridge_set]
+
+    # 把 external_neighbors 接到 keep (用一个直接边, 权重取 drop-nb 边的权重)
+    for nb in external_neighbors:
+        if not G.has_edge(keep, nb):
+            w = G[drop][nb]['weight']
+            G.add_edge(keep, nb, weight=w)
+
+    # 删除桥接路径上 keep 和 drop 之间的所有中间节点 + drop
+    for n in path[1:]:  # path[0] = keep
+        if n in G:
+            G.remove_node(n)
+
+
+# ============================================================
+# BFS 建树
+# ============================================================
+
+def _build_tree_from_graph(G, id_to_point, dist_map, origin, pitch):
+    """从最终图 BFS 建有根树。根选距离变换最大的端点。"""
+    remaining = list(G.nodes())
+    endpoints = [n for n in remaining if G.degree(n) == 1]
+
+    if endpoints:
+        root = max(endpoints, key=lambda ep: dist_map[id_to_point[ep]])
+    else:
+        root = max(remaining, key=lambda n: dist_map[id_to_point[n]])
+
+    visited = set()
+    queue = deque([(root, -1)])
+    visited.add(root)
+    bfs_order = []
+    old_to_new = {}
+    counter = 0
+    while queue:
+        node, parent_old = queue.popleft()
+        bfs_order.append((node, parent_old))
+        old_to_new[node] = counter
+        counter += 1
+        for nb in G.neighbors(node):
+            if nb not in visited:
+                visited.add(nb)
+                queue.append((nb, node))
+
+    children_map = {old_id: [] for old_id, _ in bfs_order}
+    for old_id, parent_old in bfs_order:
+        if parent_old != -1 and parent_old in children_map:
+            children_map[parent_old].append(old_id)
+
+    tree = []
+    for old_id, parent_old in bfs_order:
+        new_id = old_to_new[old_id]
+        vi, vj, vk = id_to_point[old_id]
+        phys = voxel_to_physical([vi, vj, vk], origin, pitch)
+        px, py, pz = float(phys[0]), float(phys[1]), float(phys[2])
+        parent_new = old_to_new[parent_old] if parent_old != -1 else -1
+        children = children_map[old_id]
+        lc = old_to_new[children[0]] if len(children) >= 1 else -1
+        rc = old_to_new[children[1]] if len(children) >= 2 else -1
+        if len(children) > 2:
+            print(f"       警告: 节点 {new_id} 有 {len(children)} 个孩子, "
+                  f"保留前 2 个")
+        tree.append([new_id, px, py, pz, parent_new, lc, rc])
+
+    return tree
+
+
+if __name__ == '__main__':
+    import sys
+    path = sys.argv[1] if len(sys.argv) > 1 else r"F:\example\vessel.stl"
+    extract_centerline(path)
