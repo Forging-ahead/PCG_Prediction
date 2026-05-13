@@ -28,7 +28,9 @@ from extract_centerline import extract_centerline
 from smooth_centerline import smooth_centerline
 from segment_vessels import (segment_vessels, is_post_tips,
                               is_invalid_folder)
-from extract_features import extract_all_features
+from extract_features import (FEATURE_DESCRIPTION_FILENAME,
+                              build_feature_description,
+                              extract_all_features)
 from extract_profiles import extract_profiles
 from export_visualization import export_patient_visualization
 from visualize_segments import visualize_segments
@@ -223,6 +225,16 @@ def process_stl_files(root_folder, params, steps,
     if not os.path.exists(root_folder):
         print(f"根目录不存在: {root_folder}")
         return
+
+    desc_path = os.path.join(root_folder, FEATURE_DESCRIPTION_FILENAME)
+    try:
+        import json
+        with open(desc_path, 'w', encoding='utf-8') as f:
+            json.dump(build_feature_description(), f, indent=2,
+                      ensure_ascii=False, allow_nan=True)
+        print(f"feature_description 已保存: {desc_path}")
+    except Exception as e:
+        print(f"feature_description 保存失败: {e}")
 
     subfolders = sorted([
         f for f in os.listdir(root_folder)

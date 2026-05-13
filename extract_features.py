@@ -629,6 +629,12 @@ def extract_all_features(stl_path, n_fit_points=10,
 UNIFIED_SCHEMA_VERSION = "v2"
 FEATURE_DESCRIPTION_FILENAME = "feature_description.json"
 
+POINTWISE_CORE_VALID_KEYS = [
+    'area',
+    'eq_diameter',
+    'perimeter',
+]
+
 SYSTEM_FEATURE_GROUPS = {
     'A_angles': [
         'angle_sv_smv', 'angle_mpv_lpv', 'angle_mpv_rpv',
@@ -904,6 +910,114 @@ def _pointwise_diag(profile):
         'valid_diameter_points': _finite_positive_count(
             profile.get('eq_diameter', [])),
     }
+
+
+def _is_missing_json_value(value):
+    """JSON 输出前统一判断 None / NaN / inf 这类不可训练值。"""
+    if value is None:
+        return True
+    try:
+        if isinstance(value, (float, np.floating)):
+            return not np.isfinite(float(value))
+    except Exception:
+        return False
+    return False
+
+
+def _list_like(value):
+    return isinstance(value, (list, tuple))
+
+
+def _infer_point_count(profile):
+    lengths = [
+        len(v) for v in profile.values()
+        if _list_like(v) and not isinstance(v, (str, bytes))
+    ]
+    if not lengths:
+        return 0
+    return max(set(lengths), key=lengths.count)
+
+
+def _clean_scalar_for_json(value):
+    if _is_missing_json_value(value):
+        return None
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def _clean_pointwise_profile_for_unified(profile):
+    """
+    写 unified_features.json 前清洗逐点剖面。
+
+    extract_profiles 为了保持 100 点对齐, 会在端点/交叉保护区把截面值写成
+    NaN。统一特征文件用于训练时不再保留这些占位点: 只要核心截面通道
+    area/eq_diameter/perimeter 任一无效, 就删除该位置在所有逐点通道中的值。
+    """
+    if not isinstance(profile, dict):
+        return None
+
+    n_points = _infer_point_count(profile)
+    if n_points <= 0:
+        return dict(profile)
+
+    core_keys = [
+        k for k in POINTWISE_CORE_VALID_KEYS
+        if _list_like(profile.get(k)) and len(profile.get(k)) == n_points
+    ]
+    point_feature_keys = [
+        k for k, v in profile.items()
+        if _list_like(v) and len(v) == n_points
+    ]
+
+    keep_mask = []
+    for i in range(n_points):
+        keep = True
+        for key in point_feature_keys:
+            if _is_missing_json_value(profile[key][i]):
+                keep = False
+                break
+        if not keep:
+            keep_mask.append(False)
+            continue
+        for key in core_keys:
+            value = profile[key][i]
+            if _is_missing_json_value(value):
+                keep = False
+                break
+            try:
+                if float(value) <= 0:
+                    keep = False
+                    break
+            except Exception:
+                keep = False
+                break
+        keep_mask.append(keep)
+
+    kept_indices = [i for i, keep in enumerate(keep_mask) if keep]
+    cleaned = {}
+    for key, value in profile.items():
+        if _list_like(value) and len(value) == n_points:
+            cleaned[key] = [
+                _clean_scalar_for_json(value[i])
+                for i in kept_indices
+            ]
+        else:
+            cleaned[key] = _clean_scalar_for_json(value)
+
+    cleaned['_point_filter'] = {
+        'original_n_points': int(n_points),
+        'kept_n_points': int(len(kept_indices)),
+        'removed_n_points': int(n_points - len(kept_indices)),
+        'removed_reason': (
+            '任一逐点通道存在 None/NaN/inf, 或核心截面通道 '
+            'area/eq_diameter/perimeter <=0, '
+            '该逐点位置已从 unified pointwise 中删除。'
+        ),
+        'validity_keys': point_feature_keys,
+        'positive_core_keys': core_keys,
+    }
+    return cleaned
 
 
 def _seg_missing_reason(seg_name, seg_info, profile, feature_key,
@@ -1438,12 +1552,14 @@ def build_unified_features(flat_features, pointwise_data, seg_data,
     # ---- pointwise (剥掉 _meta 单独处理, 内部有 inscribed_radius 等) ----
     pointwise_block = {}
     pointwise_meta = {}
-    if pointwise_data:
+    if pointwise_data is not None:
         for k, v in pointwise_data.items():
             if k == '_meta':
                 pointwise_meta = v
             elif v is not None:
-                pointwise_block[k] = v
+                cleaned_profile = _clean_pointwise_profile_for_unified(v)
+                if cleaned_profile is not None:
+                    pointwise_block[k] = cleaned_profile
 
     # ---- segments_meta: 每段的 path / 长度 / 起止节点 ----
     seg_meta_block = {}
