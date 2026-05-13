@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+
+# 环境变量 / 敏感信息
+.env
+*.local
+
+# IDE
+.vscode/
+.idea/
+
+# 操作系统生成文件
+.DS_Store
+Thumbs.db
+
+# 编译产物
+dist/
+build/
+*.exe
