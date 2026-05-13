@@ -216,10 +216,21 @@ def _flatten_unified_to_features(unified):
     glob = unified.get('global') or {}
     for k, v in glob.items():
         out[k] = v
-    # system
+    # system: v1 是扁平 dict; v2 拆成 available / unavailable。
     system = unified.get('system') or {}
-    for k, v in system.items():
-        out[k] = v
+    if isinstance(system, dict) and (
+            'available' in system or 'unavailable' in system):
+        for k, v in (system.get('available') or {}).items():
+            out[k] = v
+        all_values = system.get('all_values') or {}
+        for k in SYSTEM_FEATURES:
+            if k not in out:
+                out[k] = all_values.get(k)
+        for k in (system.get('unavailable') or {}):
+            out.setdefault(k, None)
+    else:
+        for k, v in system.items():
+            out[k] = v
     return out
 
 

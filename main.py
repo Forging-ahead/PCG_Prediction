@@ -5,8 +5,8 @@
   Step 1:    中心线提取        → CenterlinePoints.txt
   Step 2:    中心线平滑        → newCenterlist.txt
   Step 3:    解剖分段          → centerline_profiles.json
-  Step 4:    统计特征          → portal_vein_features.json
-  Step 5:    剖面特征          → centerline_pointwise_profiles.json
+  Step 4:    剖面特征          → centerline_pointwise_profiles.json
+  Step 5:    统计/统一特征     → portal_vein_features.json + unified_features.json + feature_description.json
   Step 5.5:  导出可视化        → vis_interactive.html + vis_overview.png
   Step 6:    VTK 弹窗 (可选)
 
@@ -60,6 +60,7 @@ def _clean_old_outputs(folder_path):
                 "centerline_profiles.json",
                 "portal_vein_features.json",
                 "unified_features.json",
+                "feature_description.json",
                 "centerline_pointwise_profiles.json",
                 "sv_smv_angle.json",
                 "vis_interactive.html",
@@ -140,23 +141,7 @@ def _process_one_patient(stl_path, post_tips, params, steps):
                     print(f"  [Step 5.5] 降级可视化失败: {ee}")
             return status
 
-    # ---- Step 4: 统计特征 ----
-    if steps.extract_features:
-        try:
-            t0 = time.time()
-            extract_all_features(
-                stl_path,
-                n_fit_points=params['n_fit_points'],
-                curvature_window=params['curvature_window'],
-                sample_step=params['sample_step'],
-                pitch=params['pitch'])
-            print(f"  [Step 4] 统计特征: {time.time()-t0:.2f}s")
-            status['features'] = True
-        except Exception as e:
-            print(f"  [Step 4] 统计特征失败: {e}")
-            traceback.print_exc()
-
-    # ---- Step 5: 剖面特征 ----
+    # ---- Step 4: 剖面特征 ----
     if steps.extract_profiles:
         try:
             t0 = time.time()
@@ -167,12 +152,29 @@ def _process_one_patient(stl_path, post_tips, params, steps):
                 curvature_window=params['curvature_window'],
                 section_step=params['sample_step'],
                 ownership_factor=params['ownership_factor'],
+                junction_policy=params['junction_policy'],
                 max_diameter_rate_per_mm=params[
                     'max_diameter_rate_per_mm'])
-            print(f"  [Step 5] 剖面特征: {time.time()-t0:.2f}s")
+            print(f"  [Step 4] 剖面特征: {time.time()-t0:.2f}s")
             status['profiles'] = True
         except Exception as e:
-            print(f"  [Step 5] 剖面特征失败: {e}")
+            print(f"  [Step 4] 剖面特征失败: {e}")
+            traceback.print_exc()
+
+    # ---- Step 5: 统计 + 统一特征 ----
+    if steps.extract_features:
+        try:
+            t0 = time.time()
+            extract_all_features(
+                stl_path,
+                n_fit_points=params['n_fit_points'],
+                curvature_window=params['curvature_window'],
+                sample_step=params['sample_step'],
+                pitch=params['pitch'])
+            print(f"  [Step 5] 统计/统一特征: {time.time()-t0:.2f}s")
+            status['features'] = True
+        except Exception as e:
+            print(f"  [Step 5] 统计/统一特征失败: {e}")
             traceback.print_exc()
 
     # ---- Step 5.5: 导出可视化 (HTML + PNG) ----
@@ -375,6 +377,7 @@ DEFAULT_PARAMS = {
     'sample_step': 3,
     'ownership_factor': 1.8,        # 中心线锚定最大内切半径裁剪倍数:
                                      # clean_area = raw_section ∩ circle(c, k*r_anchor)
+    'junction_policy': 'min_valid', # 分叉/交叉区不丢弃, 用本段可信最小截面替换
     'max_diameter_rate_per_mm': 0.5,  # 沿管轴等效直径相对变化率上限 (1/mm)
                                        # 0.5 = 每 mm 最多 50% 变化, 超阈孤立
                                        # 点视为单点突变伪影

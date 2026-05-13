@@ -259,8 +259,12 @@ def _find_max_section(profile, edge_margin=0.05):
         return None
     areas = np.array(profile['area'], dtype=float)
 
-    # 用 nanmax 跳过端点掩码的 NaN
+    junction = np.asarray(profile.get('junction_replaced',
+                                      np.zeros(len(areas))), dtype=float)
+
+    # 用 nanmax 跳过端点掩码的 NaN; 最大截面优先避开交叉区替换点.
     valid_mask = np.isfinite(areas) & (areas > 0)
+    primary_valid_mask = valid_mask & ~(junction > 0.5)
     if not np.any(valid_mask):
         return None
 
@@ -269,7 +273,8 @@ def _find_max_section(profile, edge_margin=0.05):
     hi = int(n * (1 - edge_margin))
 
     middle = areas[lo:hi].copy()
-    middle_valid = np.isfinite(middle) & (middle > 0)
+    middle_primary = primary_valid_mask[lo:hi]
+    middle_valid = np.isfinite(middle) & (middle > 0) & middle_primary
 
     if np.any(middle_valid):
         # 中间区间找峰值, 用 nanargmax 跳过 NaN
@@ -277,8 +282,9 @@ def _find_max_section(profile, edge_margin=0.05):
         masked_middle = np.where(middle_valid, middle, -np.inf)
         idx = int(np.argmax(masked_middle)) + lo
     else:
-        # 中间无有效值, 整段找
-        masked_all = np.where(valid_mask, areas, -np.inf)
+        search_mask = primary_valid_mask if np.any(primary_valid_mask) else valid_mask
+        # 中间无有效值, 整段找; 若整段只剩交叉保护点, 才兜底用它们.
+        masked_all = np.where(search_mask, areas, -np.inf)
         idx = int(np.argmax(masked_all))
 
     return {
@@ -296,6 +302,7 @@ def _find_max_section(profile, edge_margin=0.05):
                          if 'anchor_radius' in profile else None,
         'owned_radius': float(profile['owned_radius'][idx])
                         if 'owned_radius' in profile else None,
+        'junction_replaced': float(junction[idx]) if len(junction) > idx else 0.0,
         'position_pct': idx,
     }
 def _interp_centerline_at_pos(seg_path, nodes, pos_idx, n_total=100):
@@ -505,7 +512,8 @@ def _build_max_section_traces(seg_data, pointwise_profiles, nodes, stl_mesh):
                     f"清洗面积: {max_info['area']:.2f} mm²<br>"
                     f"原始面积: {max_info['raw_area']:.2f} mm²<br>"
                     f"周长: {max_info['perimeter']:.2f} mm<br>"
-                    f"等效直径: {max_info['eq_diameter']:.2f} mm"
+                    f"等效直径: {max_info['eq_diameter']:.2f} mm<br>"
+                    f"交叉区替换: {'是' if max_info['junction_replaced'] > 0.5 else '否'}"
                     "<extra></extra>"),
             ))
             print(f"      [{label}] @ {max_info['position_pct']}%, "
@@ -552,6 +560,7 @@ def _build_max_section_traces(seg_data, pointwise_profiles, nodes, stl_mesh):
                 f"清洗截面积: {max_info['area']:.2f} mm²<br>"
                 f"原始截面积: {max_info['raw_area']:.2f} mm²<br>"
                 f"等效直径: {max_info['eq_diameter']:.2f} mm<br>"
+                f"交叉区替换: {'是' if max_info['junction_replaced'] > 0.5 else '否'}<br>"
                 f"坐标: ({point[0]:.1f}, {point[1]:.1f}, {point[2]:.1f})"
                 "<extra></extra>"),
         ))

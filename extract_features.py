@@ -607,12 +607,17 @@ def extract_all_features(stl_path, n_fit_points=10,
 
     if write_unified:
         unified_path = os.path.join(parentdir, "unified_features.json")
+        description_path = os.path.join(parentdir, FEATURE_DESCRIPTION_FILENAME)
         unified = build_unified_features(
             all_features, pointwise_data, seg_data,
             angle_detail=save_data)
         with open(unified_path, 'w', encoding='utf-8') as f:
             json.dump(unified, f, indent=2, ensure_ascii=False, allow_nan=True)
+        with open(description_path, 'w', encoding='utf-8') as f:
+            json.dump(build_feature_description(), f, indent=2,
+                      ensure_ascii=False, allow_nan=True)
         print(f"[Unified] 统一特征已保存: {unified_path}")
+        print(f"[Unified] 特征说明已保存: {description_path}")
 
     return all_features
 
@@ -621,7 +626,247 @@ def extract_all_features(stl_path, n_fit_points=10,
 # 统一 JSON 组装
 # ============================================================
 
-UNIFIED_SCHEMA_VERSION = "v1"
+UNIFIED_SCHEMA_VERSION = "v2"
+FEATURE_DESCRIPTION_FILENAME = "feature_description.json"
+
+SYSTEM_FEATURE_GROUPS = {
+    'A_angles': [
+        'angle_sv_smv', 'angle_mpv_lpv', 'angle_mpv_rpv',
+        'angle_lpv_rpv', 'angle_mpv_bifurc_total',
+        'mpv_bifurc_planarity_deg', 'angle_mpv_tips',
+    ],
+    'B_diameter_area_ratio': [
+        'sv_smv_diameter_asymmetry', 'sv_mpv_diameter_ratio',
+        'smv_mpv_diameter_ratio', 'confluence_murray3_ratio',
+        'confluence_murray3_deviation', 'confluence_area_ratio',
+        'mpv_bifurc_murray3_ratio', 'mpv_bifurc_murray3_deviation',
+        'mpv_bifurc_area_ratio', 'lpv_rpv_diameter_asymmetry',
+        'lgv_mpv_diameter_ratio', 'pgv_mpv_diameter_ratio',
+        'splenic_dominance_index',
+    ],
+    'C_length_tortuosity': [
+        'splenoportal_path_chord_ratio',
+        'collateral_length_mpv_ratio',
+        'diameter_weighted_tortuosity',
+    ],
+    'D_hydraulic': [
+        'mpv_resistance_integral', 'sv_resistance_integral',
+        'smv_resistance_integral', 'lpv_resistance_integral',
+        'rpv_resistance_integral', 'tips_resistance_integral',
+        'inflow_parallel_resistance', 'inflow_resistance_asymmetry',
+        'mpv_effective_radius', 'tips_inflow_resistance_ratio',
+    ],
+    'E_topology': [
+        'collateral_burden_score', 'n_collaterals_detected',
+        'branchpoint_density_per_cm', 'mpv_taper_coefficient',
+        'mpv_proximal_diameter', 'mpv_distal_diameter',
+        'mpv_min_max_diameter_ratio', 'tree_area_conservation_mean_dev',
+    ],
+    'F_clinical': [
+        'sv_max_to_mpv_max_diam_ratio', 'mpv_trunk_length_mm',
+        'max_tortuosity_index', 'mean_tortuosity_index',
+        'max_collateral_diameter_mm',
+        'area_conservation_bifurc_deviation',
+        'tips_stent_diameter_mm', 'tips_stent_length_mm',
+        'pvt_severity_grade', 'min_lumen_area_to_max_ratio_mpv',
+        'cavernous_transformation_flag',
+    ],
+}
+
+SYSTEM_FEATURE_DEPENDENCIES = {
+    'angle_sv_smv': {'required_vessels': ['sv', 'smv']},
+    'angle_mpv_lpv': {'required_vessels': ['mpv', 'lpv']},
+    'angle_mpv_rpv': {'required_vessels': ['mpv', 'rpv']},
+    'angle_lpv_rpv': {'required_vessels': ['lpv', 'rpv']},
+    'angle_mpv_bifurc_total': {'required_vessels': ['mpv', 'lpv', 'rpv']},
+    'mpv_bifurc_planarity_deg': {'required_vessels': ['mpv', 'lpv', 'rpv']},
+    'angle_mpv_tips': {'required_vessels': ['mpv', 'tips']},
+    'sv_smv_diameter_asymmetry': {
+        'required_vessels': ['sv', 'smv'],
+        'source_features': ['sv_mean_diameter', 'smv_mean_diameter'],
+    },
+    'sv_mpv_diameter_ratio': {
+        'required_vessels': ['sv', 'mpv'],
+        'source_features': ['sv_mean_diameter', 'mpv_mean_diameter'],
+    },
+    'smv_mpv_diameter_ratio': {
+        'required_vessels': ['smv', 'mpv'],
+        'source_features': ['smv_mean_diameter', 'mpv_mean_diameter'],
+    },
+    'confluence_murray3_ratio': {
+        'required_vessels': ['mpv', 'sv', 'smv'],
+        'source_features': [
+            'mpv_mean_diameter', 'sv_mean_diameter', 'smv_mean_diameter'],
+    },
+    'confluence_murray3_deviation': {
+        'required_vessels': ['mpv', 'sv', 'smv'],
+        'source_features': ['confluence_murray3_ratio'],
+    },
+    'confluence_area_ratio': {
+        'required_vessels': ['mpv', 'sv', 'smv'],
+        'source_features': ['mpv_mean_area', 'sv_mean_area', 'smv_mean_area'],
+    },
+    'mpv_bifurc_murray3_ratio': {
+        'required_vessels': ['mpv', 'lpv', 'rpv'],
+        'source_features': [
+            'mpv_mean_diameter', 'lpv_mean_diameter', 'rpv_mean_diameter'],
+    },
+    'mpv_bifurc_murray3_deviation': {
+        'required_vessels': ['mpv', 'lpv', 'rpv'],
+        'source_features': ['mpv_bifurc_murray3_ratio'],
+    },
+    'mpv_bifurc_area_ratio': {
+        'required_vessels': ['mpv', 'lpv', 'rpv'],
+        'source_features': ['mpv_mean_area', 'lpv_mean_area', 'rpv_mean_area'],
+    },
+    'lpv_rpv_diameter_asymmetry': {
+        'required_vessels': ['lpv', 'rpv'],
+        'source_features': ['lpv_mean_diameter', 'rpv_mean_diameter'],
+    },
+    'lgv_mpv_diameter_ratio': {
+        'required_vessels': ['lgv', 'mpv'],
+        'source_features': ['lgv_mean_diameter', 'mpv_mean_diameter'],
+    },
+    'pgv_mpv_diameter_ratio': {
+        'required_vessels': ['pgv', 'mpv'],
+        'source_features': ['pgv_mean_diameter', 'mpv_mean_diameter'],
+    },
+    'splenic_dominance_index': {
+        'required_vessels': ['sv', 'smv'],
+        'source_features': ['sv_mean_diameter', 'smv_mean_diameter'],
+    },
+    'splenoportal_path_chord_ratio': {'required_vessels': ['sv', 'mpv']},
+    'collateral_length_mpv_ratio': {
+        'required_vessels': ['mpv'],
+        'required_any_vessels': ['lgv', 'pgv'],
+        'source_features': ['mpv_length', 'lgv_length', 'pgv_length'],
+    },
+    'diameter_weighted_tortuosity': {
+        'required_min_present_vessels': {
+            'vessels': ['mpv', 'sv', 'smv', 'lpv', 'rpv'],
+            'min_count': 2,
+        },
+    },
+    'mpv_resistance_integral': {
+        'required_vessels': ['mpv'], 'requires_pointwise': True,
+        'source_features': ['mpv_length'],
+    },
+    'sv_resistance_integral': {
+        'required_vessels': ['sv'], 'requires_pointwise': True,
+        'source_features': ['sv_length'],
+    },
+    'smv_resistance_integral': {
+        'required_vessels': ['smv'], 'requires_pointwise': True,
+        'source_features': ['smv_length'],
+    },
+    'lpv_resistance_integral': {
+        'required_vessels': ['lpv'], 'requires_pointwise': True,
+        'source_features': ['lpv_length'],
+    },
+    'rpv_resistance_integral': {
+        'required_vessels': ['rpv'], 'requires_pointwise': True,
+        'source_features': ['rpv_length'],
+    },
+    'tips_resistance_integral': {
+        'required_vessels': ['tips'], 'requires_pointwise': True,
+        'source_features': ['tips_length'],
+    },
+    'inflow_parallel_resistance': {
+        'required_vessels': ['sv', 'smv'], 'requires_pointwise': True,
+        'source_features': ['sv_resistance_integral',
+                            'smv_resistance_integral'],
+    },
+    'inflow_resistance_asymmetry': {
+        'required_vessels': ['sv', 'smv'], 'requires_pointwise': True,
+        'source_features': ['sv_resistance_integral',
+                            'smv_resistance_integral'],
+    },
+    'mpv_effective_radius': {
+        'required_vessels': ['mpv'], 'requires_pointwise': True,
+        'source_features': ['mpv_length', 'mpv_resistance_integral'],
+    },
+    'tips_inflow_resistance_ratio': {
+        'required_vessels': ['tips', 'sv', 'smv'],
+        'requires_pointwise': True,
+        'source_features': ['tips_resistance_integral',
+                            'inflow_parallel_resistance'],
+    },
+    'collateral_burden_score': {
+        'required_vessels': ['mpv'],
+        'optional_vessels': ['lgv', 'pgv'],
+        'source_features': ['mpv_length', 'mpv_mean_diameter'],
+    },
+    'n_collaterals_detected': {'optional_vessels': ['lgv', 'pgv']},
+    'branchpoint_density_per_cm': {
+        'required_vessels': ['mpv'],
+        'source_features': ['mpv_length'],
+    },
+    'mpv_taper_coefficient': {
+        'required_vessels': ['mpv'], 'requires_pointwise': True,
+        'source_features': ['mpv_length'],
+    },
+    'mpv_proximal_diameter': {
+        'required_vessels': ['mpv'], 'requires_pointwise': True,
+        'source_features': ['mpv_length'],
+    },
+    'mpv_distal_diameter': {
+        'required_vessels': ['mpv'], 'requires_pointwise': True,
+        'source_features': ['mpv_length'],
+    },
+    'mpv_min_max_diameter_ratio': {
+        'required_vessels': ['mpv'], 'requires_pointwise': True,
+        'source_features': ['mpv_length'],
+    },
+    'tree_area_conservation_mean_dev': {
+        'required_vessel_sets_any': [
+            ['mpv', 'sv', 'smv'], ['mpv', 'lpv', 'rpv']],
+        'source_features': [
+            'mpv_mean_area', 'sv_mean_area', 'smv_mean_area',
+            'lpv_mean_area', 'rpv_mean_area'],
+    },
+    'sv_max_to_mpv_max_diam_ratio': {
+        'required_vessels': ['sv', 'mpv'],
+        'source_features': ['sv_max_diameter', 'mpv_max_diameter'],
+    },
+    'mpv_trunk_length_mm': {
+        'required_vessels': ['mpv'], 'source_features': ['mpv_length'],
+    },
+    'max_tortuosity_index': {
+        'required_min_present_vessels': {
+            'vessels': ['mpv', 'sv', 'smv', 'lpv', 'rpv', 'lgv', 'pgv',
+                        'tips'],
+            'min_count': 1,
+        },
+    },
+    'mean_tortuosity_index': {
+        'required_min_present_vessels': {
+            'vessels': ['mpv', 'sv', 'smv', 'lpv', 'rpv', 'lgv', 'pgv',
+                        'tips'],
+            'min_count': 1,
+        },
+    },
+    'max_collateral_diameter_mm': {'optional_vessels': ['lgv', 'pgv']},
+    'area_conservation_bifurc_deviation': {
+        'required_vessels': ['mpv', 'lpv', 'rpv'],
+        'source_features': ['mpv_mean_area', 'lpv_mean_area', 'rpv_mean_area'],
+    },
+    'tips_stent_diameter_mm': {
+        'required_vessels': ['tips'], 'source_features': ['tips_mean_diameter'],
+    },
+    'tips_stent_length_mm': {
+        'required_vessels': ['tips'], 'source_features': ['tips_length'],
+    },
+    'pvt_severity_grade': {
+        'required_vessels': ['mpv'], 'requires_pointwise': True,
+    },
+    'min_lumen_area_to_max_ratio_mpv': {
+        'required_vessels': ['mpv'], 'requires_pointwise': True,
+    },
+    'cavernous_transformation_flag': {
+        'optional_vessels': ['mpv', 'lgv', 'pgv'],
+        'source_features': ['mpv_max_diameter', 'branchpoint_density_per_cm'],
+    },
+}
 
 
 def _nested_per_seg(flat, prefix, keys):
@@ -653,6 +898,8 @@ def _pointwise_diag(profile):
         'n_rejected_oversize': profile.get('n_rejected_oversize'),
         'n_local_outliers': profile.get('n_local_outliers'),
         'n_rate_outliers': profile.get('n_rate_outliers'),
+        'n_junction_protected': profile.get('n_junction_protected'),
+        'n_junction_replaced': profile.get('n_junction_replaced'),
         'valid_area_points': _finite_positive_count(profile.get('area', [])),
         'valid_diameter_points': _finite_positive_count(
             profile.get('eq_diameter', [])),
@@ -802,6 +1049,275 @@ def _system_missing_reason(name, flat, seg_dict, pointwise_data,
     return "依赖条件不足或几何退化, 具体依赖请检查同名输入段/pointwise 剖面。"
 
 
+def _system_group_for_feature(name):
+    for group_name, names in SYSTEM_FEATURE_GROUPS.items():
+        if name in names:
+            return group_name
+    return None
+
+
+def _dependency_vessels_from_spec(spec):
+    vessels = []
+    vessels.extend(spec.get('required_vessels', []))
+    vessels.extend(spec.get('required_any_vessels', []))
+    vessels.extend(spec.get('optional_vessels', []))
+    for vessel_set in spec.get('required_vessel_sets_any', []):
+        vessels.extend(vessel_set)
+    min_present = spec.get('required_min_present_vessels')
+    if min_present:
+        vessels.extend(min_present.get('vessels', []))
+    return sorted(set(vessels), key=ALL_SEG_NAMES.index)
+
+
+def _missing_vessels_for_feature(name, seg_dict):
+    spec = SYSTEM_FEATURE_DEPENDENCIES.get(name, {})
+    missing = [
+        v for v in spec.get('required_vessels', [])
+        if seg_dict.get(v) is None
+    ]
+
+    any_vessels = spec.get('required_any_vessels', [])
+    if any_vessels and not any(seg_dict.get(v) is not None
+                              for v in any_vessels):
+        missing.extend(any_vessels)
+
+    vessel_sets = spec.get('required_vessel_sets_any', [])
+    if vessel_sets and not any(
+            all(seg_dict.get(v) is not None for v in vessel_set)
+            for vessel_set in vessel_sets):
+        for vessel_set in vessel_sets:
+            missing.extend([v for v in vessel_set if seg_dict.get(v) is None])
+
+    min_present = spec.get('required_min_present_vessels')
+    if min_present:
+        vessels = min_present.get('vessels', [])
+        min_count = int(min_present.get('min_count', 1))
+        present_count = sum(1 for v in vessels if seg_dict.get(v) is not None)
+        if present_count < min_count:
+            missing.extend([v for v in vessels if seg_dict.get(v) is None])
+
+    return sorted(set(missing), key=ALL_SEG_NAMES.index)
+
+
+def _pointwise_missing_segments_for_feature(name, seg_dict, pointwise_data):
+    spec = SYSTEM_FEATURE_DEPENDENCIES.get(name, {})
+    if not spec.get('requires_pointwise'):
+        return []
+
+    target_vessels = spec.get('required_vessels', [])
+    if not target_vessels and spec.get('required_vessel_sets_any'):
+        target_vessels = _dependency_vessels_from_spec(spec)
+
+    target_vessels = [
+        v for v in target_vessels
+        if v in ALL_SEG_NAMES and seg_dict.get(v) is not None
+    ]
+    if pointwise_data is None:
+        return target_vessels
+    return [v for v in target_vessels if pointwise_data.get(v) is None]
+
+
+def _system_unavailable_detail(name, flat, seg_dict, pointwise_data,
+                               branch_points, angle_detail):
+    spec = SYSTEM_FEATURE_DEPENDENCIES.get(name, {})
+    missing_vessels = _missing_vessels_for_feature(name, seg_dict)
+    missing_pointwise = _pointwise_missing_segments_for_feature(
+        name, seg_dict, pointwise_data)
+    source_features = spec.get('source_features', [])
+    missing_source_features = _deps_missing(source_features, flat)
+
+    if missing_vessels:
+        unavailable_due_to = 'vessel_absent'
+        reason_category = 'vessel_absent'
+    elif missing_pointwise:
+        unavailable_due_to = 'extraction_failed'
+        reason_category = 'pointwise_missing_or_failed'
+    elif missing_source_features:
+        unavailable_due_to = 'extraction_failed'
+        reason_category = 'source_feature_missing'
+    else:
+        unavailable_due_to = 'extraction_failed'
+        reason_category = 'geometry_or_quality_failed'
+
+    return {
+        'value': None,
+        'unavailable_due_to': unavailable_due_to,
+        'reason_category': reason_category,
+        'reason': _system_missing_reason(
+            name, flat, seg_dict, pointwise_data, branch_points,
+            angle_detail),
+        'dependent_vessels': _dependency_vessels_from_spec(spec),
+        'missing_vessels': missing_vessels,
+        'requires_pointwise': bool(spec.get('requires_pointwise')),
+        'missing_pointwise_segments': missing_pointwise,
+        'source_features': source_features,
+        'missing_source_features': missing_source_features,
+    }
+
+
+def _split_system_features(system_values, flat, seg_data, pointwise_data,
+                           angle_detail):
+    seg_dict = seg_data.get('segments') or {}
+    branch_points = seg_data.get('branch_points')
+    available = {}
+    unavailable = {}
+
+    for name in SYSTEM_FEATURE_NAMES:
+        value = system_values.get(name)
+        if value is None:
+            unavailable[name] = _system_unavailable_detail(
+                name, flat, seg_dict, pointwise_data, branch_points,
+                angle_detail)
+        else:
+            available[name] = value
+
+    return {
+        'available': available,
+        'unavailable': unavailable,
+        'all_values': system_values,
+    }
+
+
+def _build_vessel_presence(seg_data, pointwise_data, statistical):
+    seg_dict = seg_data.get('segments') or {}
+    out = {}
+    for seg_name in ALL_SEG_NAMES:
+        seg_info = seg_dict.get(seg_name)
+        profile = pointwise_data.get(seg_name) if pointwise_data else None
+        present = seg_info is not None
+
+        if not present:
+            pointwise_status = 'segment_absent'
+        elif pointwise_data is None:
+            pointwise_status = 'pointwise_file_missing_or_unreadable'
+        elif profile is None:
+            pointwise_status = 'pointwise_profile_missing_or_failed'
+        else:
+            pointwise_status = 'available'
+
+        out[seg_name] = {
+            'present': bool(present),
+            'has_statistical_features': bool(seg_name in statistical),
+            'has_pointwise_profile': bool(profile is not None),
+            'pointwise_status': pointwise_status,
+            'pointwise_diag': _pointwise_diag(profile),
+        }
+    return out
+
+
+def build_feature_description():
+    """生成独立的特征说明 JSON, 不含任何患者样本值。"""
+    statistical_features = {
+        key: {
+            'depends_on_vessels': '<segment>',
+            'flat_key_pattern': f'<segment>_{key}',
+            'missing_rule': (
+                '如果该 segment 血管不存在, 对应统计特征不可计算; '
+                '如果血管存在但截面/中心线提取失败, 值也可能为 None。'
+            ),
+        }
+        for key in PER_SEG_FEATURE_KEYS
+    }
+
+    system_features = {}
+    for name in SYSTEM_FEATURE_NAMES:
+        spec = SYSTEM_FEATURE_DEPENDENCIES.get(name, {})
+        system_features[name] = {
+            'label_cn': SYSTEM_FEATURE_LABELS_CN.get(name, name),
+            'group': _system_group_for_feature(name),
+            'depends_on_vessels': _dependency_vessels_from_spec(spec),
+            'required_vessels': spec.get('required_vessels', []),
+            'required_any_vessels': spec.get('required_any_vessels', []),
+            'required_vessel_sets_any': spec.get(
+                'required_vessel_sets_any', []),
+            'required_min_present_vessels': spec.get(
+                'required_min_present_vessels'),
+            'optional_vessels': spec.get('optional_vessels', []),
+            'requires_pointwise': bool(spec.get('requires_pointwise')),
+            'source_features': spec.get('source_features', []),
+        }
+
+    return {
+        '_schema_version': UNIFIED_SCHEMA_VERSION,
+        'description': (
+            '特征说明文件。这里记录字段含义、分组、依赖血管和缺失规则; '
+            '患者样本的具体数值保存在 unified_features.json。'
+        ),
+        'vessels': {
+            'names': ALL_SEG_NAMES,
+            'labels_cn': {
+                'mpv': '门静脉主干',
+                'sv': '脾静脉',
+                'smv': '肠系膜上静脉',
+                'lpv': '左门静脉',
+                'rpv': '右门静脉',
+                'tips': 'TIPS 支架/分流道',
+                'lgv': '胃左静脉侧支',
+                'pgv': '胃后静脉侧支',
+            },
+        },
+        'missing_value_policy': {
+            'vessel_absent': (
+                '样本没有检测到该特征依赖的血管, 该特征按解剖/分割结构不可计算。'
+            ),
+            'extraction_failed': (
+                '依赖血管存在, 但中心线、截面、pointwise 或几何拟合质量不足。'
+            ),
+            'pointwise_missing_or_failed': (
+                '特征需要 centerline_pointwise_profiles.json 中的逐点剖面, '
+                '但文件或对应血管剖面缺失。'
+            ),
+            'source_feature_missing': (
+                '上游统计特征为 None, 因此下游 system 特征无法计算。'
+            ),
+        },
+        'statistical': {
+            'description': '每段血管的 9 个标量统计特征。',
+            'segments': ALL_SEG_NAMES,
+            'feature_keys': PER_SEG_FEATURE_KEYS,
+            'features': statistical_features,
+        },
+        'system': {
+            'description': '跨血管系统特征, 每个字段列出依赖血管。',
+            'feature_names': SYSTEM_FEATURE_NAMES,
+            'groups': SYSTEM_FEATURE_GROUPS,
+            'labels_cn': SYSTEM_FEATURE_LABELS_CN,
+            'features': system_features,
+        },
+        'global': {
+            'description': '样本/树级全局特征与血管存在性标志。',
+            'feature_keys': GLOBAL_FEATURE_KEYS,
+            'dependencies': {
+                'total_centerline_length': [],
+                'sv_smv_diameter_ratio': ['sv', 'smv'],
+                'sv_smv_angle': ['sv', 'smv'],
+                'has_lgv': ['lgv'],
+                'has_pgv': ['pgv'],
+                'has_compensation_vessel': ['lgv', 'pgv'],
+                'has_tips': ['tips'],
+            },
+        },
+        'pointwise': {
+            'description': (
+                '逐点剖面, 每个 segment 依赖同名血管存在且 extract_profiles 成功。'
+            ),
+            'segments': ALL_SEG_NAMES,
+            'feature_keys': [
+                'position', 'arc_length_mm', 'total_length_mm',
+                'area', 'eq_diameter', 'perimeter',
+                'raw_area', 'raw_eq_diameter', 'raw_perimeter',
+                'anchor_radius', 'owned_radius', 'hydraulic_diameter',
+                'circularity', 'solidity', 'r_insc_to_r_eq_ratio',
+                'n_components', 'junction_replaced', 'curvature',
+                'torsion', 'dA_ds_norm', 'inscribed_radius',
+                'edge_margin_pct', 'edge_margin_mm', 'n_masked_endpoints',
+                'n_junction_protected', 'n_junction_replaced',
+                'n_rejected_oversize', 'n_section_success',
+            ],
+        },
+    }
+
+
 def _build_missing_report(flat, statistical, system, global_block,
                           pointwise_block, pointwise_data, seg_data,
                           angle_detail):
@@ -892,9 +1408,10 @@ def build_unified_features(flat_features, pointwise_data, seg_data,
 
     顶层结构:
         _meta            病人 ID / TIPS / 代偿
-        _index           各字段块的说明 (字段使用文档)
+        _feature_description_file  独立特征说明 JSON 文件名
+        vessel_presence 当前样本的血管存在性与 pointwise 状态
         statistical      每段 9 个标量特征 {seg: {key: value}}
-        system           系统 / 联合特征 (扁平)
+        system           系统 / 联合特征, 拆成 available / unavailable / all_values
         global           全局/树级 (扁平, 含 has_*)
         sv_smv_angle     夹角详细信息 (向量, 汇合点等)
         pointwise        逐点剖面 (沿用 extract_profiles 的格式)
@@ -911,7 +1428,9 @@ def build_unified_features(flat_features, pointwise_data, seg_data,
             statistical[seg_name] = block
 
     # ---- system features ----
-    system = {k: flat.get(k) for k in SYSTEM_FEATURE_NAMES}
+    system_values = {k: flat.get(k) for k in SYSTEM_FEATURE_NAMES}
+    system = _split_system_features(
+        system_values, flat, seg_data, pointwise_data, angle_detail)
 
     # ---- global ----
     global_block = {k: flat.get(k) for k in GLOBAL_FEATURE_KEYS}
@@ -939,6 +1458,9 @@ def build_unified_features(flat_features, pointwise_data, seg_data,
             'endpoints_id': info.get('endpoints_id'),
             'endpoints_coord': info.get('endpoints_coord'),
         }
+
+    vessel_presence = _build_vessel_presence(
+        seg_data, pointwise_data, statistical)
 
     # ---- _index: 文档说明 ----
     index = {
@@ -1001,42 +1523,52 @@ def build_unified_features(flat_features, pointwise_data, seg_data,
             'description': 'SV-SMV 汇合处的几何细节 (汇合点坐标 + 两支单位向量)',
         },
         'pointwise': {
-            'description': '逐点剖面 (重采样到 n_points), 含端点 NaN 掩码',
+            'description': '逐点剖面 (重采样到 n_points), 真实末端 NaN 掩码; 交叉区用可信最小截面替换/封顶',
             'segments': list(pointwise_block.keys()),
             'feature_keys': ['position', 'arc_length_mm', 'total_length_mm',
                              'area', 'eq_diameter', 'perimeter',
+                             'raw_area', 'raw_eq_diameter', 'raw_perimeter',
+                             'anchor_radius', 'owned_radius',
                              'hydraulic_diameter',       # 4A/P, 非圆截面用
                              'circularity',
                              'solidity',                  # A / 凸包面积 (PVT)
                              'r_insc_to_r_eq_ratio',      # 瓶颈程度
                              'n_components',              # lumen 分量数
+                             'junction_replaced',         # 1=交叉区已替换/封顶
                              'curvature',
                              'torsion',                   # 中心线 3D 扭转
                              'dA_ds_norm',                # 局部锥度
                              'inscribed_radius',
                              'edge_margin_pct', 'edge_margin_mm',
-                             'n_masked_endpoints', 'n_rejected_oversize',
+                             'n_masked_endpoints',
+                             'n_junction_protected', 'n_junction_replaced',
+                             'n_rejected_oversize',
                              'n_section_success'],
             'channel_labels_cn': {
-                'area': '截面面积 mm²',
-                'eq_diameter': '等效直径 mm',
-                'perimeter': '截面周长 mm',
+                'area': '清洗/归属截面面积 mm²',
+                'eq_diameter': '清洗/归属等效直径 mm',
+                'perimeter': '清洗/归属截面周长 mm',
+                'raw_area': '原始STL切面面积 mm²',
+                'raw_eq_diameter': '原始STL切面等效直径 mm',
+                'raw_perimeter': '原始STL切面周长 mm',
+                'anchor_radius': '中心线锚定内切半径 mm',
+                'owned_radius': '归属限制圆半径 mm',
                 'hydraulic_diameter': '水力直径 4A/P (任意形状)',
                 'circularity': '圆度 4πA/P²',
                 'solidity': '凸包实心度 (PVT指标)',
                 'r_insc_to_r_eq_ratio': '内切/等效半径比 (瓶颈)',
                 'n_components': 'lumen 连通分量数',
+                'junction_replaced': '交叉区替换/封顶标记',
                 'curvature': '曲率 1/mm',
                 'torsion': '挠率 1/mm (NaN 可信度)',
                 'dA_ds_norm': '面积归一化变化率 (1/mm)',
                 'inscribed_radius': '内切球半径 mm',
             },
             'mask_explanation': (
-                'area / eq_diameter / perimeter / circularity / hydraulic_diameter '
-                '/ solidity / r_insc_to_r_eq_ratio / n_components / dA_ds_norm '
-                '/ inscribed_radius 在端点保护带 (edge_margin_pct + edge_margin_mm) '
-                '内为 NaN; 另对超过内切直径×inscribed_factor 的截面也丢弃 '
-                '(防止穿透到邻近血管). torsion 在直线段曲率近 0 处为 NaN.'
+                '真实血管末端保护带内仍为 NaN; 分叉/交叉点保护带内不再丢弃, '
+                '默认用该段非交叉可信区域的最小 clean area 对应截面替换, '
+                '并用 junction_replaced=1 标记。raw_* 保留原始STL切面, '
+                'area/eq_diameter/perimeter 用于统计与训练。'
             ),
         },
         'segments_meta': {
@@ -1052,9 +1584,10 @@ def build_unified_features(flat_features, pointwise_data, seg_data,
             'has_compensation': seg_data.get('has_compensation'),
             'compensation_type': seg_data.get('compensation_type'),
         },
-        '_index': index,
+        '_feature_description_file': FEATURE_DESCRIPTION_FILENAME,
+        'vessel_presence': vessel_presence,
         '_missing': _build_missing_report(
-            flat, statistical, system, global_block, pointwise_block,
+            flat, statistical, system_values, global_block, pointwise_block,
             pointwise_data, seg_data, angle_detail),
         'statistical': statistical,
         'system': system,

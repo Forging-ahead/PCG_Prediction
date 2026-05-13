@@ -888,23 +888,73 @@ def _extract_branch_raw_profile(branch_path, nodes, mesh,
     }
 
 
+def _copy_section_values(profile, src_idx, dst_mask, keys):
+    """把一个可信截面的主通道复制到一组目标点。"""
+    n = len(profile['position'])
+    dst_idx = np.where(dst_mask)[0]
+    if len(dst_idx) == 0:
+        return
+    for key in keys:
+        if key not in profile:
+            continue
+        values = list(profile[key])
+        if src_idx < 0 or src_idx >= len(values):
+            continue
+        src_val = values[src_idx]
+        for i in dst_idx:
+            if 0 <= i < n:
+                values[i] = src_val
+        profile[key] = values
+
+
+def _refresh_dA_ds_norm(profile):
+    """根据当前 area 重新计算归一化面积变化率。"""
+    try:
+        area = np.asarray(profile.get('area', []), dtype=float)
+        arc = np.asarray(profile.get('arc_length_mm', []), dtype=float)
+        if len(area) != len(arc) or len(area) < 3 or not np.all(np.diff(arc) > 0):
+            return
+        if np.sum(np.isfinite(area) & (area > 0)) < 3:
+            profile['dA_ds_norm'] = [float('nan')] * len(area)
+            return
+        grad = np.gradient(area, arc)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            dA_ds = grad / np.where(area > 1e-6, area, np.nan)
+        dA_ds[(area <= 0) | ~np.isfinite(area)] = np.nan
+        profile['dA_ds_norm'] = dA_ds.tolist()
+    except Exception:
+        return
+
+
 def _apply_endpoint_mask(profile, edge_margin_pct=0.05,
-                         edge_margin_mm=8.0):
+                         edge_margin_mm=8.0,
+                         branchpoint_arcs=None,
+                         terminal_start=True,
+                         terminal_end=True,
+                         junction_policy='min_valid'):
     """
-    将段端点附近的截面值标记为 NaN。
+    处理段端点/交叉点附近的截面值。
 
-    端点附近的截面常因以下原因失真:
-      - STL 在血管末端的收口产生封闭面
-      - 分叉点附近切平面穿透到相邻血管
+    真实血管末端附近仍标记为 NaN, 避免 STL 开口/收口伪影。
+    分叉/交叉点附近不再丢弃: 默认用该段可信区域的最小 clean area
+    对应截面替换这些点, 让它们参与平均面积等统计, 但不再可能成为
+    错误的最大截面。
 
-    判定条件 (并集): 满足任一即标记 NaN
-      1. 位置百分比 < edge_margin_pct 或 > (1 - edge_margin_pct)
-      2. 距段起点弧长 < edge_margin_mm 或距段终点弧长 < edge_margin_mm
+    判定:
+      - 真实末端: 距起/终点 < edge_margin_mm 或落在端点百分比保护带
+      - 交叉点: 距 branchpoint_arcs 任一弧长 < junction_margin
+
+    junction_policy:
+      - 'min_valid': 用非末端、非交叉保护区中 clean area 最小的截面替换
+      - 'cap_min':  只把交叉区中大于最小可信面积的点封顶到最小可信截面
+      - 'keep':     交叉区不处理
 
     参数:
         profile:           _resample_profile 返回的 dict (100 点剖面)
         edge_margin_pct:   端点保护比例 (默认 0.05 = 前后 5%)
         edge_margin_mm:    端点保护绝对距离 mm (默认 8.0)
+        branchpoint_arcs:   当前段路径上所有分叉点的弧长位置(mm)
+        terminal_start/end: 当前段首/尾是否真实血管末端; 分叉点端不是末端
 
     返回:
         修改后的 profile (原地修改)
@@ -917,16 +967,32 @@ def _apply_endpoint_mask(profile, edge_margin_pct=0.05,
     arc = np.array(profile['arc_length_mm'])  # 0..total_length
     total = profile.get('total_length_mm', arc[-1] if len(arc) > 0 else 0)
 
-    # 条件 1: 位置百分比
-    pct_mask = (pos < edge_margin_pct) | (pos > 1 - edge_margin_pct)
+    # 真实末端保护: 只对非分叉的开口/末端置 NaN.
+    start_pct_mask = pos < edge_margin_pct
+    end_pct_mask = pos > 1 - edge_margin_pct
 
-    # 条件 2: 距段端点的实际距离
     dist_to_start = arc
     dist_to_end = total - arc
-    mm_mask = (dist_to_start < edge_margin_mm) | (dist_to_end < edge_margin_mm)
+    start_mm_mask = dist_to_start < edge_margin_mm
+    end_mm_mask = dist_to_end < edge_margin_mm
 
-    # 并集
-    invalid_mask = pct_mask | mm_mask
+    terminal_mask = np.zeros(n, dtype=bool)
+    if terminal_start:
+        terminal_mask |= start_pct_mask | start_mm_mask
+    if terminal_end:
+        terminal_mask |= end_pct_mask | end_mm_mask
+
+    # 交叉点保护: 不丢弃, 用本段可信最小截面替换/封顶.
+    junction_mask = np.zeros(n, dtype=bool)
+    branchpoint_arcs = branchpoint_arcs or []
+    junction_margin = max(float(edge_margin_mm), float(total) * edge_margin_pct)
+    for bp_arc in branchpoint_arcs:
+        try:
+            bp_arc = float(bp_arc)
+        except Exception:
+            continue
+        junction_mask |= np.abs(arc - bp_arc) < junction_margin
+    junction_mask &= ~terminal_mask
 
     # 标记的 keys (截面相关特征 + 新增形状/水力派生)
     section_keys = ['area', 'perimeter', 'eq_diameter',
@@ -937,20 +1003,57 @@ def _apply_endpoint_mask(profile, edge_margin_pct=0.05,
                     'r_insc_to_r_eq_ratio', 'n_components',
                     'dA_ds_norm']
 
-    n_masked = int(np.sum(invalid_mask))
+    n_masked = int(np.sum(terminal_mask))
     if n_masked > 0:
         for key in section_keys:
             if key in profile:
                 values = list(profile[key])
                 for i in range(n):
-                    if invalid_mask[i]:
+                    if terminal_mask[i]:
                         values[i] = float('nan')
                 profile[key] = values
+
+    n_junction = int(np.sum(junction_mask))
+    n_junction_replaced = 0
+    area = np.asarray(profile.get('area', []), dtype=float)
+    trusted_mask = (
+        np.isfinite(area) & (area > 0)
+        & ~terminal_mask & ~junction_mask
+    )
+    if n_junction > 0 and junction_policy in ('min_valid', 'cap_min'):
+        reference_mask = trusted_mask
+        if not np.any(reference_mask):
+            # 短段可能几乎全在交叉保护区内; 这时退回到整段有效最小值,
+            # 仍然避免交叉区异常大截面成为最大截面.
+            reference_mask = np.isfinite(area) & (area > 0) & ~terminal_mask
+        if np.any(reference_mask):
+            trusted_idx = np.where(reference_mask)[0]
+            min_idx = int(trusted_idx[np.argmin(area[trusted_idx])])
+            main_keys = ['area', 'perimeter', 'eq_diameter',
+                         'hydraulic_diameter', 'circularity', 'solidity',
+                         'r_insc_to_r_eq_ratio', 'n_components']
+            if junction_policy == 'min_valid':
+                replace_mask = junction_mask
+            else:
+                replace_mask = junction_mask & np.isfinite(area) & (
+                    area > area[min_idx])
+            _copy_section_values(profile, min_idx, replace_mask, main_keys)
+            n_junction_replaced = int(np.sum(replace_mask))
+
+    # 标记哪些点来自交叉区替换, 便于可视化和诊断.
+    marker = [0.0] * n
+    for i in np.where(junction_mask)[0]:
+        marker[int(i)] = 1.0
+    profile['junction_replaced'] = marker
+    _refresh_dA_ds_norm(profile)
 
     # 元信息记录
     profile['edge_margin_pct'] = float(edge_margin_pct)
     profile['edge_margin_mm'] = float(edge_margin_mm)
     profile['n_masked_endpoints'] = n_masked
+    profile['n_junction_protected'] = n_junction
+    profile['n_junction_replaced'] = n_junction_replaced
+    profile['junction_policy'] = junction_policy
 
     return profile
 
@@ -1088,12 +1191,26 @@ def _resample_profile(raw_profile, n_points=100):
 # ============================================================
 # 主入口 (改为读 JSON 驱动)
 # ============================================================
+def _branchpoint_arcs_for_path(seg_path, nodes, branchpoint_ids):
+    """返回当前段路径上所有分叉点的弧长位置。"""
+    if not seg_path or not branchpoint_ids:
+        return []
+    coords = path_to_coords(seg_path, nodes)
+    if len(coords) != len(seg_path):
+        return []
+    diffs = np.linalg.norm(np.diff(coords, axis=0), axis=1)
+    arc = np.concatenate(([0.0], np.cumsum(diffs)))
+    return [float(arc[i]) for i, nid in enumerate(seg_path)
+            if int(nid) in branchpoint_ids]
+
+
 def extract_profiles(stl_path, n_points=100, pitch=0.5,
                      curvature_window=7, section_step=3,
                      edge_margin_pct=0.05,
                      edge_margin_mm=8.0,
                      inscribed_factor=1.8,
                      ownership_factor=1.8,
+                     junction_policy='min_valid',
                      max_diameter_rate_per_mm=0.5):
     """
     为每个解剖段提取 100 点剖面 (含截面特征)。
@@ -1113,6 +1230,10 @@ def extract_profiles(stl_path, n_points=100, pitch=0.5,
                            (默认 1.8). 用于过滤穿透到邻近血管的"超大"截面.
         ownership_factor:  中心线锚定清洗半径倍数 (默认 1.8).
                            用于保留当前血管主体并裁剪分叉污染区域.
+        junction_policy:   分叉/交叉点保护策略:
+                           'min_valid' 用本段可信最小截面替换交叉区;
+                           'cap_min' 只封顶异常大截面;
+                           'keep' 保留 clean area, 不替换。
         max_diameter_rate_per_mm: 沿管轴允许的等效直径相对变化率 (1/mm),
                                   默认 0.5 = 每 mm 最多 50% 相对变化.
                                   超阈孤立点视为伪影截面 (单点塌陷/膨胀).
@@ -1137,9 +1258,15 @@ def extract_profiles(stl_path, n_points=100, pitch=0.5,
 
     profiles = {}
     n_total_masked = 0
+    n_total_junction_protected = 0
+    n_total_junction_replaced = 0
     n_total_rejected_oversize = 0
     n_total_local_outliers = 0
     n_total_rate_outliers = 0
+    branchpoint_ids = {
+        int(bp['id']) for bp in seg_data.get('branch_points', [])
+        if isinstance(bp, dict) and 'id' in bp
+    }
 
     for seg_name, seg_info in seg_data['segments'].items():
         if seg_info is None:
@@ -1173,11 +1300,21 @@ def extract_profiles(stl_path, n_points=100, pitch=0.5,
                 profiles[seg_name] = None
                 continue
 
-            # 应用端点掩码
+            seg_path_ids = [int(nid) for nid in seg_info['path']]
+            branchpoint_arcs = _branchpoint_arcs_for_path(
+                seg_path_ids, nodes, branchpoint_ids)
+            terminal_start = seg_path_ids[0] not in branchpoint_ids
+            terminal_end = seg_path_ids[-1] not in branchpoint_ids
+
+            # 应用真实末端掩码 + 交叉区最小截面替换/封顶
             resampled = _apply_endpoint_mask(
                 resampled,
                 edge_margin_pct=edge_margin_pct,
-                edge_margin_mm=edge_margin_mm)
+                edge_margin_mm=edge_margin_mm,
+                branchpoint_arcs=branchpoint_arcs,
+                terminal_start=terminal_start,
+                terminal_end=terminal_end,
+                junction_policy=junction_policy)
 
             # 透传过滤元信息
             resampled['n_rejected_oversize'] = int(
@@ -1190,6 +1327,10 @@ def extract_profiles(stl_path, n_points=100, pitch=0.5,
                 raw_profile.get('_n_success', 0))
 
             n_total_masked += resampled.get('n_masked_endpoints', 0)
+            n_total_junction_protected += resampled.get(
+                'n_junction_protected', 0)
+            n_total_junction_replaced += resampled.get(
+                'n_junction_replaced', 0)
             profiles[seg_name] = resampled
 
         except Exception as e:
@@ -1205,8 +1346,11 @@ def extract_profiles(stl_path, n_points=100, pitch=0.5,
         'edge_margin_mm': float(edge_margin_mm),
         'inscribed_factor': float(inscribed_factor),
         'ownership_factor': float(ownership_factor),
+        'junction_policy': junction_policy,
         'max_diameter_rate_per_mm': float(max_diameter_rate_per_mm),
         'n_total_masked': int(n_total_masked),
+        'n_total_junction_protected': int(n_total_junction_protected),
+        'n_total_junction_replaced': int(n_total_junction_replaced),
         'n_total_rejected_oversize': int(n_total_rejected_oversize),
         'n_total_local_outliers': int(n_total_local_outliers),
         'n_total_rate_outliers': int(n_total_rate_outliers),
@@ -1221,6 +1365,7 @@ def extract_profiles(stl_path, n_points=100, pitch=0.5,
             'solidity',                  # A / 凸包面积, ∈ (0,1], 1=凸
             'r_insc_to_r_eq_ratio',      # 2r_insc / D_eq, 瓶颈程度
             'n_components',              # lumen 分量数 (1=正常, 2+=被血栓隔断)
+            'junction_replaced',         # 1=交叉区使用可信最小截面替换/封顶
             'curvature',
             'torsion',                   # Frenet 挠率, 中心线 3D 扭转 (NaN 友好)
             'dA_ds_norm',                # (dA/ds)/A, 局部锥度 (NaN 友好)
@@ -1236,6 +1381,8 @@ def extract_profiles(stl_path, n_points=100, pitch=0.5,
                    if v is not None and not k.startswith('_')]
     print(f"  剖面提取完成: {len(valid_segs)} 个段, "
           f"端点掩码 {n_total_masked} 处, "
+          f"交叉区保护 {n_total_junction_protected} 处 "
+          f"(替换/封顶 {n_total_junction_replaced} 处), "
           f"形状/内切超限剔除 {n_total_rejected_oversize} 处, "
           f"局部异常剔除 {n_total_local_outliers} 处, "
           f"变化率剔除 {n_total_rate_outliers} 处")
