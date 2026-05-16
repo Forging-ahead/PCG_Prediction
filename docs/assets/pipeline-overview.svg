@@ -1,0 +1,111 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="520" viewBox="0 0 1120 520" role="img" aria-labelledby="title desc">
+  <title id="title">PPG Prediction 单患者与跨患者处理流水线</title>
+  <desc id="desc">从 STL 血管模型开始，依次进行中心线提取、平滑、解剖分段、剖面特征、统一特征、可视化导出，并在跨患者层面做相关性分析。</desc>
+  <defs>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="8" stdDeviation="8" flood-color="#17212b" flood-opacity="0.10"/>
+    </filter>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#5f7184"/>
+    </marker>
+    <style>
+      .bg { fill: #f6f8fb; }
+      .band { fill: #ffffff; stroke: #d8e1ea; stroke-width: 1.2; filter: url(#shadow); }
+      .label { font: 700 23px "Microsoft YaHei", "Segoe UI", sans-serif; fill: #142230; }
+      .sub { font: 13px "Microsoft YaHei", "Segoe UI", sans-serif; fill: #607184; }
+      .box { fill: #ffffff; stroke: #cfd9e3; stroke-width: 1.4; rx: 12; }
+      .box-accent { fill: #eef8f7; stroke: #177e89; }
+      .box-orange { fill: #fff4e9; stroke: #d9822b; }
+      .box-purple { fill: #f5efff; stroke: #7b4cc2; }
+      .box-green { fill: #ecf8f0; stroke: #217a52; }
+      .step { font: 700 15px "Microsoft YaHei", "Segoe UI", sans-serif; fill: #17212b; }
+      .file { font: 12px Consolas, "Cascadia Mono", monospace; fill: #516273; }
+      .arrow { stroke: #5f7184; stroke-width: 2.2; fill: none; marker-end: url(#arrow); }
+      .pill { fill: #1f3a45; }
+      .pill-text { font: 700 13px "Microsoft YaHei", "Segoe UI", sans-serif; fill: #ffffff; }
+    </style>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1120" height="520"/>
+
+  <text class="label" x="40" y="52">PPG Prediction 流水线总览</text>
+  <text class="sub" x="40" y="78">单患者：STL 三维血管模型转为中心线、解剖段、剖面曲线和统一特征；跨患者：将特征与 PVP/PCG 做统计关联。</text>
+
+  <rect class="band" x="34" y="105" width="1052" height="250" rx="18"/>
+  <rect class="pill" x="58" y="128" width="126" height="30" rx="15"/>
+  <text class="pill-text" x="78" y="148">单患者处理</text>
+
+  <g transform="translate(58 182)">
+    <rect class="box box-accent" x="0" y="0" width="116" height="94"/>
+    <text class="step" x="18" y="27">输入</text>
+    <text class="file" x="18" y="53">vessel.stl</text>
+    <text class="file" x="18" y="72">label/*.txt</text>
+  </g>
+
+  <line class="arrow" x1="184" y1="229" x2="225" y2="229"/>
+  <g transform="translate(234 182)">
+    <rect class="box" x="0" y="0" width="126" height="94"/>
+    <text class="step" x="16" y="27">Step 1</text>
+    <text class="sub" x="16" y="50">中心线提取</text>
+    <text class="file" x="16" y="72">CenterlinePoints</text>
+  </g>
+
+  <line class="arrow" x1="370" y1="229" x2="408" y2="229"/>
+  <g transform="translate(417 182)">
+    <rect class="box" x="0" y="0" width="126" height="94"/>
+    <text class="step" x="16" y="27">Step 2</text>
+    <text class="sub" x="16" y="50">样条平滑</text>
+    <text class="file" x="16" y="72">newCenterlist</text>
+  </g>
+
+  <line class="arrow" x1="553" y1="229" x2="591" y2="229"/>
+  <g transform="translate(600 182)">
+    <rect class="box box-orange" x="0" y="0" width="126" height="94"/>
+    <text class="step" x="16" y="27">Step 3</text>
+    <text class="sub" x="16" y="50">解剖分段</text>
+    <text class="file" x="16" y="72">profiles.json</text>
+  </g>
+
+  <line class="arrow" x1="736" y1="229" x2="774" y2="229"/>
+  <g transform="translate(783 182)">
+    <rect class="box box-purple" x="0" y="0" width="126" height="94"/>
+    <text class="step" x="16" y="27">Step 4</text>
+    <text class="sub" x="16" y="50">逐点剖面</text>
+    <text class="file" x="16" y="72">pointwise.json</text>
+  </g>
+
+  <line class="arrow" x1="919" y1="229" x2="957" y2="229"/>
+  <g transform="translate(966 182)">
+    <rect class="box box-green" x="0" y="0" width="96" height="94"/>
+    <text class="step" x="16" y="27">Step 5</text>
+    <text class="sub" x="16" y="50">统一特征</text>
+    <text class="file" x="16" y="72">unified</text>
+  </g>
+
+  <path class="arrow" d="M1014 276 C1014 325, 824 325, 824 294"/>
+  <g transform="translate(646 298)">
+    <rect class="box" x="0" y="0" width="356" height="36"/>
+    <text class="sub" x="18" y="23">Step 5.5 / Step 6：导出交互 HTML、PNG，或打开 VTK 检查分段与截面</text>
+  </g>
+
+  <rect class="band" x="34" y="385" width="1052" height="92" rx="18"/>
+  <rect class="pill" x="58" y="416" width="126" height="30" rx="15"/>
+  <text class="pill-text" x="78" y="436">跨患者分析</text>
+  <line class="arrow" x1="204" y1="431" x2="292" y2="431"/>
+  <g transform="translate(308 404)">
+    <rect class="box box-green" x="0" y="0" width="202" height="54"/>
+    <text class="step" x="18" y="24">Step A</text>
+    <text class="sub" x="78" y="24">统计/系统特征 vs PVP/PCG</text>
+    <text class="file" x="18" y="43">correlation_*.csv/png/txt</text>
+  </g>
+  <line class="arrow" x1="526" y1="431" x2="614" y2="431"/>
+  <g transform="translate(630 404)">
+    <rect class="box box-purple" x="0" y="0" width="232" height="54"/>
+    <text class="step" x="18" y="24">Step B</text>
+    <text class="sub" x="78" y="24">逐点剖面曲线 vs PVP/PCG</text>
+    <text class="file" x="18" y="43">profile_correlation_*</text>
+  </g>
+  <line class="arrow" x1="878" y1="431" x2="944" y2="431"/>
+  <text class="sub" x="960" y="426">推荐特征、报告、</text>
+  <text class="sub" x="960" y="446">训练输入表</text>
+</svg>

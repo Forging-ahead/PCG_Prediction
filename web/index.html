@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>PPG Vessel Workbench</title>
+  <link rel="stylesheet" href="/styles.css" />
+  <script src="/assets/plotly.min.js"></script>
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <header class="brand">
+        <div class="brand-mark">PPG</div>
+        <div>
+          <h1>血管处理工作台</h1>
+          <p id="serverState">本地服务已连接</p>
+        </div>
+      </header>
+
+      <section class="panel">
+        <div class="panel-title">输入</div>
+        <div class="segmented" role="tablist" aria-label="处理模式">
+          <button id="singleModeBtn" class="active" type="button">单文件</button>
+          <button id="batchModeBtn" type="button">批量</button>
+        </div>
+
+        <form id="singleForm" class="input-form">
+          <label class="field">
+            <span>STL 文件</span>
+            <input id="stlFile" type="file" accept=".stl" />
+          </label>
+          <label class="field">
+            <span>输出目录</span>
+            <input id="singleOutputDir" type="text" placeholder="可选" />
+          </label>
+        </form>
+
+        <form id="batchForm" class="input-form hidden">
+          <label class="field">
+            <span>文件夹路径</span>
+            <input id="batchRoot" type="text" placeholder="E:\dataset" />
+          </label>
+          <label class="field">
+            <span>STL 文件名</span>
+            <input id="stlName" type="text" value="vessel.stl" />
+          </label>
+        </form>
+
+        <button id="createSessionBtn" class="primary-btn" type="button">载入</button>
+        <label class="field">
+          <span>病例</span>
+          <select id="patientSelect"></select>
+        </label>
+      </section>
+
+      <section class="panel">
+        <div class="panel-title">流程</div>
+        <div class="run-row">
+          <button id="runAllBtn" class="primary-btn" type="button">自动全流程</button>
+          <button id="refreshBtn" type="button">刷新</button>
+        </div>
+        <div id="stepButtons" class="step-list"></div>
+        <div class="run-row">
+          <button id="paramsBtn" type="button">参数</button>
+          <button id="downloadBtn" type="button">下载结果</button>
+        </div>
+        <label class="toggle-line">
+          <input id="exportPng" type="checkbox" />
+          <span>导出 PNG</span>
+        </label>
+        <label class="field">
+          <span>TIPS 类型</span>
+          <select id="postTipsMode">
+            <option value="auto">按文件夹名</option>
+            <option value="pre">术前</option>
+            <option value="post">术后</option>
+          </select>
+        </label>
+      </section>
+
+      <section id="paramsPanel" class="panel params-panel hidden">
+        <div class="panel-title">参数配置</div>
+        <div id="paramGrid" class="param-grid"></div>
+      </section>
+
+      <section class="panel log-panel">
+        <div class="panel-title">任务日志</div>
+        <div id="jobStatus" class="job-status">空闲</div>
+        <pre id="logs"></pre>
+      </section>
+    </aside>
+
+    <main class="workspace">
+      <div class="toolbar">
+        <div class="layer-group">
+          <label><input class="layer-toggle" data-layer="mesh" type="checkbox" checked />模型</label>
+          <label><input class="layer-toggle" data-layer="rawCenterline" type="checkbox" />原始线</label>
+          <label><input class="layer-toggle" data-layer="smoothCenterline" type="checkbox" checked />平滑线</label>
+          <label><input class="layer-toggle" data-layer="segments" type="checkbox" checked />分段</label>
+          <label><input class="layer-toggle" data-layer="branchPoints" type="checkbox" />分叉点</label>
+          <label><input class="layer-toggle" data-layer="featurePoints" type="checkbox" checked />特征点</label>
+          <label><input class="layer-toggle" data-layer="sampledSections" type="checkbox" checked />间隔截面</label>
+          <label><input class="layer-toggle" data-layer="maxSections" type="checkbox" checked />最大截面</label>
+          <label><input class="layer-toggle" data-layer="meanSections" type="checkbox" checked />平均截面</label>
+          <label><input class="layer-toggle" data-layer="labels" type="checkbox" checked />标签</label>
+        </div>
+        <div class="slider-group">
+          <label>截面间隔 <input id="sectionStride" type="range" min="2" max="30" value="10" /></label>
+          <span id="sectionStrideValue">10</span>
+          <label>模型透明度 <input id="meshOpacity" type="range" min="0" max="80" value="22" /></label>
+        </div>
+      </div>
+
+      <section class="viewer-wrap">
+        <div id="viewer"></div>
+        <div id="emptyState" class="empty-state">载入 STL 后显示 3D 视图</div>
+      </section>
+
+      <section class="inspector">
+        <div>
+          <div class="panel-title">分段特征</div>
+          <div id="segmentCards" class="cards"></div>
+        </div>
+        <div>
+          <div class="panel-title">系统特征</div>
+          <div id="systemFeatures" class="feature-table"></div>
+        </div>
+        <div>
+          <div class="panel-title">点选信息</div>
+          <div id="pickedInfo" class="picked-info">未选择</div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

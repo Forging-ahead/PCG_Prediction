@@ -1,0 +1,96 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="600" viewBox="0 0 1120 600" role="img" aria-labelledby="title desc">
+  <title id="title">unified_features.json 特征结构</title>
+  <desc id="desc">展示统一特征 JSON 中 meta、statistical、pointwise、system、global 和下游分析之间的关系。</desc>
+  <defs>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="8" stdDeviation="8" flood-color="#17212b" flood-opacity="0.10"/>
+    </filter>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#607184"/>
+    </marker>
+    <style>
+      .bg { fill: #f6f8fb; }
+      .panel { fill: #ffffff; stroke: #d8e1ea; stroke-width: 1.2; filter: url(#shadow); }
+      .title { font: 700 24px "Microsoft YaHei", "Segoe UI", sans-serif; fill: #142230; }
+      .sub { font: 14px "Microsoft YaHei", "Segoe UI", sans-serif; fill: #607184; }
+      .box { fill: #ffffff; stroke: #cfd9e3; stroke-width: 1.4; rx: 14; }
+      .head { font: 700 16px "Microsoft YaHei", "Segoe UI", sans-serif; fill: #17212b; }
+      .mono { font: 12px Consolas, "Cascadia Mono", monospace; fill: #516273; }
+      .arrow { stroke: #607184; stroke-width: 2; fill: none; marker-end: url(#arrow); }
+      .accent { fill: #eef8f7; stroke: #177e89; }
+      .purple { fill: #f5efff; stroke: #7b4cc2; }
+      .green { fill: #ecf8f0; stroke: #217a52; }
+      .orange { fill: #fff4e9; stroke: #d9822b; }
+    </style>
+  </defs>
+
+  <rect class="bg" width="1120" height="600"/>
+  <rect class="panel" x="34" y="32" width="1052" height="536" rx="22"/>
+  <text class="title" x="70" y="78">统一特征文件结构：`unified_features.json`</text>
+  <text class="sub" x="70" y="106">建议训练和统计脚本优先读取统一文件；旧版扁平 `portal_vein_features.json` 仅用于向后兼容。</text>
+
+  <g transform="translate(72 150)">
+    <rect class="box accent" x="0" y="0" width="240" height="280"/>
+    <text class="head" x="24" y="34">unified_features.json</text>
+    <text class="mono" x="24" y="64">{</text>
+    <text class="mono" x="44" y="86">"_schema_version": "v1",</text>
+    <text class="mono" x="44" y="108">"_meta": {...},</text>
+    <text class="mono" x="44" y="130">"_index": {...},</text>
+    <text class="mono" x="44" y="152">"statistical": {...},</text>
+    <text class="mono" x="44" y="174">"pointwise": {...},</text>
+    <text class="mono" x="44" y="196">"system": {...},</text>
+    <text class="mono" x="44" y="218">"global": {...}</text>
+    <text class="mono" x="24" y="240">}</text>
+  </g>
+
+  <path class="arrow" d="M312 238 C360 238, 374 180, 418 180"/>
+  <path class="arrow" d="M312 268 C360 268, 374 292, 418 292"/>
+  <path class="arrow" d="M312 298 C360 298, 374 408, 418 408"/>
+
+  <g transform="translate(420 132)">
+    <rect class="box" x="0" y="0" width="258" height="92"/>
+    <text class="head" x="22" y="30">statistical</text>
+    <text class="sub" x="22" y="53">每段 9 个标量特征</text>
+    <text class="mono" x="22" y="74">mpv.mean_diameter, sv.length...</text>
+  </g>
+
+  <g transform="translate(420 248)">
+    <rect class="box purple" x="0" y="0" width="258" height="92"/>
+    <text class="head" x="22" y="30">pointwise</text>
+    <text class="sub" x="22" y="53">沿血管轴采样的剖面曲线</text>
+    <text class="mono" x="22" y="74">area[100], eq_diameter[100]...</text>
+  </g>
+
+  <g transform="translate(420 364)">
+    <rect class="box orange" x="0" y="0" width="258" height="116"/>
+    <text class="head" x="22" y="30">system</text>
+    <text class="sub" x="22" y="53">联合几何与血流动力学近似</text>
+    <text class="mono" x="22" y="76">angles / Murray ratios</text>
+    <text class="mono" x="22" y="98">Poiseuille resistance / burden</text>
+  </g>
+
+  <path class="arrow" d="M678 180 C726 180, 742 200, 786 200"/>
+  <path class="arrow" d="M678 294 C726 294, 742 262, 786 262"/>
+  <path class="arrow" d="M678 424 C726 424, 742 324, 786 324"/>
+
+  <g transform="translate(790 158)">
+    <rect class="box green" x="0" y="0" width="246" height="88"/>
+    <text class="head" x="22" y="30">模型训练输入</text>
+    <text class="sub" x="22" y="53">构建 tabular 特征矩阵</text>
+    <text class="mono" x="22" y="73">N samples x M features</text>
+  </g>
+
+  <g transform="translate(790 272)">
+    <rect class="box" x="0" y="0" width="246" height="88"/>
+    <text class="head" x="22" y="30">相关性分析</text>
+    <text class="sub" x="22" y="53">Spearman / FDR / 可视化</text>
+    <text class="mono" x="22" y="73">correlation_pvp/*.png</text>
+  </g>
+
+  <g transform="translate(790 386)">
+    <rect class="box" x="0" y="0" width="246" height="88"/>
+    <text class="head" x="22" y="30">质控与可解释性</text>
+    <text class="sub" x="22" y="53">缺失率、端点掩码、截面异常</text>
+    <text class="mono" x="22" y="73">analysis_report.txt</text>
+  </g>
+</svg>

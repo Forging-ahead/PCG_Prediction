@@ -20,3 +20,7 @@ Thumbs.db
 dist/
 build/
 *.exe
+
+# Local web workbench runtime files
+web_runs/
+web_frontend_config.json

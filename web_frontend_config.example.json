@@ -1,0 +1,6 @@
+{
+  "host": "127.0.0.1",
+  "port": 8765,
+  "conda_env": "base",
+  "conda_exe": ""
+}

@@ -89,7 +89,10 @@ def _pick_polygon_from_geometry(geom, center):
     return min(polys, key=lambda p: p.distance(center))
 
 
-def _center_owned_polygon(poly, center, ownership_factor=1.8):
+def _center_owned_polygon(poly, center, ownership_factor=1.8,
+                          min_owned_area_fraction=0.55,
+                          min_raw_circularity_to_skip=0.35,
+                          max_raw_aspect_to_skip=4.0):
     """
     用中心线锚定的最大内切半径裁剪截面。
 
@@ -110,16 +113,38 @@ def _center_owned_polygon(poly, center, ownership_factor=1.8):
     if anchor_radius <= 1e-6:
         return poly, anchor_radius, 0.0
 
+    raw_area = float(poly.area)
+    raw_peri = float(poly.exterior.length)
+    raw_circularity = (
+        float(4.0 * np.pi * raw_area / (raw_peri * raw_peri))
+        if raw_peri > 1e-6 else 0.0
+    )
+    raw_aspect = _polygon_aspect_ratio(list(poly.exterior.coords))
+
     owned_radius = float(anchor_radius * ownership_factor)
     limiter = center.buffer(owned_radius, resolution=64)
     owned_geom = poly.intersection(limiter)
     owned_poly = _pick_polygon_from_geometry(owned_geom, center)
     if owned_poly is None or owned_poly.area <= 1e-9:
         return poly, anchor_radius, owned_radius
+
+    # Guard against artificial bottlenecks when the centerline point is not
+    # perfectly centered in the lumen. In that case the nearest-wall distance
+    # can be much smaller than the real section radius, and the ownership
+    # circle clips away a large part of an otherwise compact, plausible section.
+    # We still keep clipping for irregular/elongated branch-contaminated
+    # sections, where removing spill-over is the intended behavior.
+    if (raw_area > 1e-9
+            and owned_poly.area < min_owned_area_fraction * raw_area
+            and raw_circularity >= min_raw_circularity_to_skip
+            and raw_aspect <= max_raw_aspect_to_skip):
+        return poly, anchor_radius, owned_radius
+
     return owned_poly, anchor_radius, owned_radius
 
 
 def _section_one(mesh, point, normal, max_eq_diameter=None,
+                 min_eq_diameter=None,
                  ownership_factor=1.8,
                  return_ring=False, return_metrics=False,
                  return_raw=False, return_extras=False):
@@ -232,17 +257,61 @@ def _section_one(mesh, point, normal, max_eq_diameter=None,
         center = SPoint(0.0, 0.0)
         # 有效"非微小"多边形 — 用于估计 lumen 连通分量数
         # 阈值 0.1mm² 排除离散化产生的针状碎片
-        nontrivial = [p for p in polys
-                      if p.is_valid and p.area > 0.1]
-        containing = [p for p in nontrivial if p.contains(center)]
+        valid_polys = [p for p in polys if p.is_valid and p.area > 0]
+        nontrivial = [p for p in valid_polys if p.area > 0.1]
+        candidate_pool = nontrivial if nontrivial else valid_polys
+        if not candidate_pool:
+            return fail
 
-        if containing:
-            best = min(containing, key=lambda p: p.area)
+        center_tol = 0.25
+
+        def _center_distance(poly):
+            return float(poly.distance(center))
+
+        centered = [
+            p for p in candidate_pool
+            if p.covers(center) or _center_distance(p) <= center_tol
+        ]
+        if centered:
+            # Polygonize can emit small self-intersection slivers that still
+            # contain the projected centerline point. Prefer the largest
+            # centered lumen candidate, then fall back if size filters reject it.
+            candidate_polys = sorted(centered, key=lambda p: p.area, reverse=True)
         else:
-            valid_polys = [p for p in polys if p.is_valid and p.area > 0]
-            if not valid_polys:
-                return fail
-            best = min(valid_polys, key=lambda p: p.distance(center))
+            # Avoid selecting a tiny nearest fragment when no closed loop covers
+            # the center. The candidate still has to be close relative to its
+            # equivalent radius.
+            near = []
+            for p in candidate_pool:
+                eq_r = float(np.sqrt(max(float(p.area), 0.0) / np.pi))
+                if _center_distance(p) <= max(center_tol, 0.35 * eq_r):
+                    near.append(p)
+            candidate_polys = sorted(
+                near, key=lambda p: (_center_distance(p), -float(p.area)))
+
+        if not candidate_polys:
+            return fail
+
+        best = None
+        for cand in candidate_polys:
+            owned, _, _ = _center_owned_polygon(
+                cand, center, ownership_factor=ownership_factor)
+            if owned is None or owned.is_empty:
+                continue
+            cand_area = float(owned.area)
+            cand_peri = float(owned.exterior.length)
+            if cand_area <= 1e-9 or cand_peri <= 1e-9:
+                continue
+            eq_d = float(np.sqrt(4.0 * cand_area / np.pi))
+            if max_eq_diameter is not None and eq_d > max_eq_diameter:
+                continue
+            if min_eq_diameter is not None and eq_d < min_eq_diameter:
+                continue
+            best = cand
+            break
+
+        if best is None:
+            return fail
 
         raw_area = float(best.area)
         raw_peri = float(best.exterior.length)
@@ -254,6 +323,12 @@ def _section_one(mesh, point, normal, max_eq_diameter=None,
 
         area = float(owned.area)
         peri = float(owned.exterior.length)
+
+        eq_d = float(np.sqrt(4.0 * area / np.pi)) if area > 0 else 0.0
+        if max_eq_diameter is not None and eq_d > max_eq_diameter:
+            return fail
+        if min_eq_diameter is not None and eq_d < min_eq_diameter:
+            return fail
 
         # 边界效应保护: 若给了内切直径上界, 直接拒绝越界候选
         if max_eq_diameter is not None and area > 0:
@@ -343,6 +418,7 @@ def _shape_score(area, aspect_ratio, circularity):
 def _compute_cross_section(mesh, point, normal,
                            n_perturb=12, max_angle_deg=15,
                            max_eq_diameter=None,
+                           min_eq_diameter=None,
                            ownership_factor=1.8,
                            max_aspect_ratio=4.0,
                            min_circularity=0.30,
@@ -394,6 +470,7 @@ def _compute_cross_section(mesh, point, normal,
                 a, p, ar, circ, raw_a, raw_p, anchor_r, owned_r, ncomp, sol = _section_one(
                     mesh, point, n,
                     max_eq_diameter=max_eq_diameter,
+                    min_eq_diameter=min_eq_diameter,
                     ownership_factor=ownership_factor,
                     return_metrics=True,
                     return_raw=True,
@@ -402,6 +479,7 @@ def _compute_cross_section(mesh, point, normal,
                 a, p, ar, circ, ncomp, sol = _section_one(
                     mesh, point, n,
                     max_eq_diameter=max_eq_diameter,
+                    min_eq_diameter=min_eq_diameter,
                     ownership_factor=ownership_factor,
                     return_metrics=True,
                     return_extras=True)
@@ -411,6 +489,7 @@ def _compute_cross_section(mesh, point, normal,
                 a, p, ar, circ, raw_a, raw_p, anchor_r, owned_r = _section_one(
                     mesh, point, n,
                     max_eq_diameter=max_eq_diameter,
+                    min_eq_diameter=min_eq_diameter,
                     ownership_factor=ownership_factor,
                     return_metrics=True,
                     return_raw=True)
@@ -418,6 +497,7 @@ def _compute_cross_section(mesh, point, normal,
                 a, p, ar, circ = _section_one(
                     mesh, point, n,
                     max_eq_diameter=max_eq_diameter,
+                    min_eq_diameter=min_eq_diameter,
                     ownership_factor=ownership_factor,
                     return_metrics=True)
                 raw_a, raw_p, anchor_r, owned_r = a, p, 0.0, 0.0
@@ -478,6 +558,39 @@ def _compute_tangents(coords, smooth_window=5):
         norm = np.linalg.norm(t)
         tangents[i] = t / norm if norm > 1e-10 else np.array([0, 0, 1])
     return tangents
+
+
+def _robust_radius_for_section_filter(inscribed_radius, window=15,
+                                      low_ratio=0.55):
+    """
+    Build a conservative radius reference for the max-diameter filter.
+
+    `inscribed_radius` is the nearest distance from the centerline point to the
+    STL surface. When the centerline drifts toward the vessel wall, that value
+    can drop abruptly even though the true cross-section is not narrow. Using
+    the raw dip as a hard upper bound makes valid sections look "too large" and
+    forces the algorithm to keep tiny clipped sections. We raise only isolated
+    low dips to their local median; sustained narrow segments keep their smaller
+    radius because the local median also drops.
+    """
+    r = np.asarray(inscribed_radius, dtype=float)
+    out = r.copy()
+    if len(r) < 3:
+        return out
+
+    half = max(1, window // 2)
+    for i in range(len(r)):
+        if not np.isfinite(r[i]) or r[i] <= 0:
+            continue
+        lo, hi = max(0, i - half), min(len(r), i + half + 1)
+        win = r[lo:hi]
+        win = win[np.isfinite(win) & (win > 0)]
+        if len(win) < 3:
+            continue
+        med = float(np.median(win))
+        if med > 0 and r[i] < low_ratio * med:
+            out[i] = med
+    return out
 
 
 def _remove_rate_outliers(area, perimeter, eq_diameter, arc_length,
@@ -749,6 +862,8 @@ def _extract_branch_raw_profile(branch_path, nodes, mesh,
 
     # ---- 内切半径 (来自 STL 表面距离, 用于边界效应过滤) ----
     inscribed_radius = _compute_inscribed_radius_per_point(coords, mesh)
+    radius_for_filter = _robust_radius_for_section_filter(
+        inscribed_radius, window=15, low_ratio=0.55)
 
     area = np.zeros(M)           # clean/owned area, downstream default
     perimeter = np.zeros(M)      # clean/owned perimeter
@@ -767,11 +882,13 @@ def _extract_branch_raw_profile(branch_path, nodes, mesh,
     n_rejected = 0
     for idx in indices:
         # 局部允许的截面等效直径上限: inscribed_factor × 内切直径
-        r_loc = inscribed_radius[idx]
+        r_loc = radius_for_filter[idx]
         max_eq_d = (2.0 * r_loc * inscribed_factor) if r_loc > 0.5 else None
+        min_eq_d = (2.0 * r_loc * 0.55) if r_loc > 0.5 else None
         a, p, raw_a, raw_p, anchor_r, owned_r, ncomp, sol = _compute_cross_section(
             mesh, coords[idx], tangents[idx],
             max_eq_diameter=max_eq_d,
+            min_eq_diameter=min_eq_d,
             ownership_factor=ownership_factor,
             return_raw=True,
             return_extras=True)
@@ -924,6 +1041,70 @@ def _refresh_dA_ds_norm(profile):
         profile['dA_ds_norm'] = dA_ds.tolist()
     except Exception:
         return
+
+
+def _mask_implausibly_small_sections(profile,
+                                     min_eq_to_inscribed_ratio=1.10,
+                                     min_inscribed_radius=0.5):
+    """
+    Remove section fragments that are too small to be compatible with the
+    centerline-to-surface distance.
+
+    For a valid lumen section, the equivalent diameter should not be far below
+    the local inscribed-radius scale. Very small values here are almost always
+    mesh-plane polygonization fragments or branch-junction artifacts. Masking
+    them prevents junction handling from copying a bad "minimum valid" section
+    across multiple points.
+    """
+    if profile is None:
+        return profile
+
+    try:
+        eq = np.asarray(profile.get('eq_diameter', []), dtype=float)
+        ins = np.asarray(profile.get('inscribed_radius', []), dtype=float)
+    except Exception:
+        profile['n_implausibly_small_sections'] = 0
+        return profile
+
+    n = len(eq)
+    if n == 0 or len(ins) != n:
+        profile['n_implausibly_small_sections'] = 0
+        return profile
+
+    bad = (
+        np.isfinite(eq) & (eq > 0)
+        & np.isfinite(ins) & (ins > min_inscribed_radius)
+        & (eq < min_eq_to_inscribed_ratio * ins)
+    )
+    bad_idx = np.where(bad)[0]
+    if len(bad_idx) == 0:
+        profile['implausibly_small_section'] = [0.0] * n
+        profile['n_implausibly_small_sections'] = 0
+        return profile
+
+    section_keys = [
+        'area', 'perimeter', 'eq_diameter',
+        'raw_area', 'raw_perimeter', 'raw_eq_diameter',
+        'anchor_radius', 'owned_radius',
+        'circularity', 'hydraulic_diameter', 'solidity',
+        'r_insc_to_r_eq_ratio', 'n_components', 'dA_ds_norm'
+    ]
+    for key in section_keys:
+        if key not in profile:
+            continue
+        values = list(profile[key])
+        if len(values) != n:
+            continue
+        for i in bad_idx:
+            values[int(i)] = float('nan')
+        profile[key] = values
+
+    marker = [0.0] * n
+    for i in bad_idx:
+        marker[int(i)] = 1.0
+    profile['implausibly_small_section'] = marker
+    profile['n_implausibly_small_sections'] = int(len(bad_idx))
+    return profile
 
 
 def _apply_endpoint_mask(profile, edge_margin_pct=0.05,
@@ -1263,6 +1444,7 @@ def extract_profiles(stl_path, n_points=100, pitch=0.5,
     n_total_rejected_oversize = 0
     n_total_local_outliers = 0
     n_total_rate_outliers = 0
+    n_total_implausibly_small = 0
     branchpoint_ids = {
         int(bp['id']) for bp in seg_data.get('branch_points', [])
         if isinstance(bp, dict) and 'id' in bp
@@ -1299,6 +1481,9 @@ def extract_profiles(stl_path, n_points=100, pitch=0.5,
             if resampled is None:
                 profiles[seg_name] = None
                 continue
+            resampled = _mask_implausibly_small_sections(resampled)
+            n_total_implausibly_small += int(
+                resampled.get('n_implausibly_small_sections', 0))
 
             seg_path_ids = [int(nid) for nid in seg_info['path']]
             branchpoint_arcs = _branchpoint_arcs_for_path(
@@ -1354,6 +1539,7 @@ def extract_profiles(stl_path, n_points=100, pitch=0.5,
         'n_total_rejected_oversize': int(n_total_rejected_oversize),
         'n_total_local_outliers': int(n_total_local_outliers),
         'n_total_rate_outliers': int(n_total_rate_outliers),
+        'n_total_implausibly_small_sections': int(n_total_implausibly_small),
         # 新增逐点通道清单 (便于训练侧统一索引)
         'pointwise_channels': [
             'position', 'arc_length_mm',
@@ -1366,6 +1552,7 @@ def extract_profiles(stl_path, n_points=100, pitch=0.5,
             'r_insc_to_r_eq_ratio',      # 2r_insc / D_eq, 瓶颈程度
             'n_components',              # lumen 分量数 (1=正常, 2+=被血栓隔断)
             'junction_replaced',         # 1=交叉区使用可信最小截面替换/封顶
+            'implausibly_small_section',
             'curvature',
             'torsion',                   # Frenet 挠率, 中心线 3D 扭转 (NaN 友好)
             'dA_ds_norm',                # (dA/ds)/A, 局部锥度 (NaN 友好)

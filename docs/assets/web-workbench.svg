@@ -1,0 +1,86 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="640" viewBox="0 0 1120 640" role="img" aria-labelledby="title desc">
+  <title id="title">PPG Vessel Web Workbench 界面示意</title>
+  <desc id="desc">展示本地 Web 工作台的侧边栏、任务日志、三维视图、图层开关和特征检查区。</desc>
+  <defs>
+    <filter id="shadow" x="-8%" y="-8%" width="116%" height="120%">
+      <feDropShadow dx="0" dy="10" stdDeviation="12" flood-color="#17212b" flood-opacity="0.14"/>
+    </filter>
+    <style>
+      .bg { fill: #eef2f5; }
+      .shell { fill: #ffffff; stroke: #d6dee7; filter: url(#shadow); }
+      .side { fill: #f6f8fa; }
+      .panel { fill: #ffffff; stroke: #d6dee7; stroke-width: 1; }
+      .title { font: 700 18px "Microsoft YaHei", "Segoe UI", sans-serif; fill: #17212b; }
+      .label { font: 13px "Microsoft YaHei", "Segoe UI", sans-serif; fill: #33465a; }
+      .small { font: 11px "Microsoft YaHei", "Segoe UI", sans-serif; fill: #627386; }
+      .btn { fill: #177e89; }
+      .btnText { font: 700 12px "Microsoft YaHei", "Segoe UI", sans-serif; fill: #ffffff; }
+      .chip { fill: #eef2f5; stroke: #d6dee7; }
+      .mesh { fill: #c7d0d8; opacity: 0.34; stroke: #9ba9b5; }
+      .line { fill: none; stroke-linecap: round; stroke-linejoin: round; }
+    </style>
+  </defs>
+  <rect class="bg" width="1120" height="640"/>
+  <rect class="shell" x="40" y="38" width="1040" height="564" rx="20"/>
+
+  <rect class="side" x="40" y="38" width="312" height="564" rx="20"/>
+  <rect x="336" y="38" width="16" height="564" fill="#f6f8fa"/>
+  <line x1="352" y1="38" x2="352" y2="602" stroke="#d6dee7"/>
+
+  <text class="title" x="70" y="78">血管处理工作台</text>
+  <text class="small" x="70" y="100">本地服务已连接 · conda env</text>
+
+  <rect class="panel" x="64" y="126" width="256" height="118" rx="10"/>
+  <text class="label" x="82" y="154">输入</text>
+  <rect class="chip" x="82" y="170" width="90" height="26" rx="6"/><text class="small" x="104" y="188">单文件</text>
+  <rect class="chip" x="180" y="170" width="90" height="26" rx="6"/><text class="small" x="205" y="188">批量</text>
+  <rect class="btn" x="82" y="208" width="210" height="26" rx="6"/><text class="btnText" x="174" y="226">载入</text>
+
+  <rect class="panel" x="64" y="258" width="256" height="166" rx="10"/>
+  <text class="label" x="82" y="286">流程</text>
+  <rect class="btn" x="82" y="302" width="210" height="28" rx="6"/><text class="btnText" x="158" y="321">自动全流程</text>
+  <g transform="translate(82 344)">
+    <rect class="chip" x="0" y="0" width="210" height="22" rx="5"/><text class="small" x="12" y="15">1 中心线提取</text><text class="small" x="160" y="15">完成</text>
+    <rect class="chip" x="0" y="28" width="210" height="22" rx="5"/><text class="small" x="12" y="43">2 解剖分段</text><text class="small" x="160" y="43">完成</text>
+    <rect class="chip" x="0" y="56" width="210" height="22" rx="5"/><text class="small" x="12" y="71">3 截面特征</text><text class="small" x="160" y="71">待运行</text>
+  </g>
+
+  <rect class="panel" x="64" y="438" width="256" height="126" rx="10"/>
+  <text class="label" x="82" y="466">任务日志</text>
+  <rect x="82" y="482" width="210" height="58" rx="6" fill="#111820"/>
+  <text class="small" x="96" y="503" fill="#dbe7ef">[OK] patient_001 / segmentation</text>
+  <text class="small" x="96" y="522" fill="#dbe7ef">[OK] visualization export</text>
+
+  <rect x="352" y="38" width="728" height="56" fill="#ffffff"/>
+  <text class="small" x="380" y="72">模型  原始线  平滑线  分段  分叉点  特征点  间隔截面  最大截面  标签</text>
+  <line x1="352" y1="94" x2="1080" y2="94" stroke="#d6dee7"/>
+
+  <rect x="374" y="118" width="684" height="324" rx="12" fill="#f8fafc" stroke="#d6dee7"/>
+  <path class="mesh" d="M604 156 C734 132 870 190 924 285 C1000 420 764 435 638 405 C504 373 430 266 498 204 C524 180 562 164 604 156Z"/>
+  <path class="line" stroke="#ff3333" stroke-width="10" d="M702 372 C708 318 722 275 742 230 C758 196 766 168 762 142"/>
+  <path class="line" stroke="#3380ff" stroke-width="10" d="M742 230 C675 220 612 204 544 176"/>
+  <path class="line" stroke="#ff9933" stroke-width="10" d="M702 372 C632 392 570 412 500 424"/>
+  <path class="line" stroke="#b34dff" stroke-width="7" d="M762 142 C724 122 690 110 650 98"/>
+  <path class="line" stroke="#33e666" stroke-width="7" d="M762 142 C812 122 862 112 914 92"/>
+  <path class="line" stroke="#00c7c7" stroke-width="7" d="M752 190 C820 192 876 212 932 240"/>
+  <circle cx="742" cy="230" r="12" fill="#17212b" stroke="#ffffff" stroke-width="3"/>
+  <circle cx="762" cy="142" r="12" fill="#17212b" stroke="#ffffff" stroke-width="3"/>
+  <ellipse cx="722" cy="288" rx="44" ry="13" fill="none" stroke="#ff3333" stroke-width="4"/>
+  <ellipse cx="640" cy="400" rx="34" ry="10" fill="none" stroke="#ff9933" stroke-width="4"/>
+  <text class="small" x="780" y="248">最大截面圈 / 曲率点 / 分段标签</text>
+
+  <rect x="374" y="466" width="210" height="94" rx="10" fill="#ffffff" stroke="#d6dee7"/>
+  <text class="label" x="394" y="494">分段特征</text>
+  <text class="small" x="394" y="520">MPV 长度、直径、面积</text>
+  <text class="small" x="394" y="540">SV / SMV / LPV / RPV</text>
+
+  <rect x="604" y="466" width="220" height="94" rx="10" fill="#ffffff" stroke="#d6dee7"/>
+  <text class="label" x="624" y="494">系统特征</text>
+  <text class="small" x="624" y="520">Murray 比、阻力积分</text>
+  <text class="small" x="624" y="540">侧支负担、夹角</text>
+
+  <rect x="844" y="466" width="214" height="94" rx="10" fill="#ffffff" stroke="#d6dee7"/>
+  <text class="label" x="864" y="494">点选信息</text>
+  <text class="small" x="864" y="520">曲率、直径、面积</text>
+  <text class="small" x="864" y="540">圆度、内切半径</text>
+</svg>
