@@ -37,13 +37,13 @@ from utils import voxelize_stl, voxel_to_physical, save_tree
 
 def extract_centerline(stl_path, output_txt_path=None,
                        pitch=0.5,
-                       min_branch_length_mm=8.0,
+                       min_branch_length_mm=10.0,
                        min_relative_length=0.05,
                        min_radius_ratio=0.4,
                        keep_radius_ratio=0.55,
-                       absolute_min_branch_length_mm=3.0,
-                       absolute_min_radius_mm=0.75,
-                       merge_bp_distance_mm=5.0,
+                       absolute_min_branch_length_mm=5.0,
+                       absolute_min_radius_mm=1.0,
+                       merge_bp_distance_mm=6.0,
                        max_prune_iterations=20,
                        verbose=True):
     """
@@ -273,7 +273,15 @@ def _enhanced_prune(G, id_to_point, id_to_radius, pitch,
             spur_only_nodes = [n for n in branch_path if n != junction]
             if not spur_only_nodes:
                 continue
-            branch_max_radius = max(id_to_radius[n] for n in spur_only_nodes)
+            branch_radii = np.asarray(
+                [id_to_radius[n] for n in spur_only_nodes], dtype=float)
+            # Ignore the junction-side tail when estimating branch thickness:
+            # those voxels often inherit the main trunk radius and can protect
+            # skeletonization spurs that are otherwise thin.
+            core_count = max(1, int(np.ceil(0.8 * len(branch_radii))))
+            branch_core_radii = branch_radii[:core_count]
+            branch_max_radius = float(np.max(branch_core_radii))
+            branch_median_radius = float(np.median(branch_core_radii))
 
             # 父主干半径(取分支点处的半径)
             junction_radius = id_to_radius[junction]
@@ -289,7 +297,7 @@ def _enhanced_prune(G, id_to_point, id_to_radius, pitch,
             # 注: 硬阈值 (极短/极细) 优先, 不进保护门.
             if (not absolute_short and not absolute_thin and
                     junction_radius > 1e-6 and
-                    branch_max_radius / junction_radius >= keep_radius_ratio):
+                    branch_median_radius / junction_radius >= keep_radius_ratio):
                 n_kept_thick_this_round += 1
                 continue
 
@@ -313,11 +321,11 @@ def _enhanced_prune(G, id_to_point, id_to_radius, pitch,
                 reason = (f"相对短(L={branch_length:.1f}mm < "
                           f"{100*min_relative_length:.0f}%)")
             elif (junction_radius > 1e-6 and
-                  branch_max_radius / junction_radius < min_radius_ratio):
+                  branch_median_radius / junction_radius < min_radius_ratio):
                 should_prune = True
                 reason = (f"细(r_branch={branch_max_radius:.2f}mm, "
                           f"r_junction={junction_radius:.2f}mm, "
-                          f"ratio={branch_max_radius/junction_radius:.2f})")
+                          f"ratio={branch_median_radius/junction_radius:.2f})")
 
             if should_prune:
                 # 剪除分支(不剪 junction 本身)

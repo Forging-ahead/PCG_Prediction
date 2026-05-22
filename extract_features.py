@@ -900,8 +900,10 @@ def _pointwise_diag(profile):
         return {}
     return {
         'n_section_success': profile.get('n_section_success'),
+        'n_section_success_final': profile.get('n_section_success_final'),
         'n_masked_endpoints': profile.get('n_masked_endpoints'),
         'n_rejected_oversize': profile.get('n_rejected_oversize'),
+        'n_relaxed_bounds': profile.get('n_relaxed_bounds'),
         'n_local_outliers': profile.get('n_local_outliers'),
         'n_rate_outliers': profile.get('n_rate_outliers'),
         'n_junction_protected': profile.get('n_junction_protected'),
