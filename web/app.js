@@ -1,12 +1,12 @@
 const DEFAULT_PARAMS = {
   pitch: 0.5,
-  min_branch_length_mm: 8.0,
+  min_branch_length_mm: 10.0,
   min_relative_length: 0.05,
   min_radius_ratio: 0.4,
   keep_radius_ratio: 0.55,
-  absolute_min_branch_length_mm: 3.0,
-  absolute_min_radius_mm: 0.75,
-  merge_bp_distance_mm: 5.0,
+  absolute_min_branch_length_mm: 5.0,
+  absolute_min_radius_mm: 1.0,
+  merge_bp_distance_mm: 6.0,
   n_fit_points: 10,
   n_profile_points: 100,
   curvature_window: 7,
@@ -61,6 +61,7 @@ const state = {
   session: null,
   data: null,
   params: { ...DEFAULT_PARAMS },
+  stepModes: Object.fromEntries(STEPS.map(([key]) => [key, "recompute"])),
   layers: { ...LAYERS },
   job: null,
   pollTimer: null,
@@ -121,6 +122,10 @@ function buildStepButtons() {
   const wrap = $("stepButtons");
   wrap.innerHTML = "";
   STEPS.forEach(([key, label], idx) => {
+    const row = document.createElement("div");
+    row.className = "step-item";
+    row.dataset.stepItem = key;
+
     const btn = document.createElement("button");
     btn.className = "step-button";
     btn.type = "button";
@@ -131,7 +136,24 @@ function buildStepButtons() {
       <span class="step-state" data-step-state="${key}">待运行</span>
     `;
     btn.addEventListener("click", () => runSteps([key], false));
-    wrap.appendChild(btn);
+
+    const mode = document.createElement("select");
+    mode.className = "step-mode";
+    mode.title = "选择该步骤导入已有中间结果或重新计算";
+    mode.dataset.stepMode = key;
+    mode.innerHTML = `
+      <option value="recompute">重新计算</option>
+      <option value="reuse">导入已有</option>
+    `;
+    mode.value = state.stepModes[key] || "recompute";
+    mode.addEventListener("change", () => {
+      state.stepModes[key] = mode.value;
+      renderStepAvailability();
+    });
+
+    row.appendChild(btn);
+    row.appendChild(mode);
+    wrap.appendChild(row);
   });
 }
 
@@ -247,6 +269,7 @@ async function runSteps(steps, allPatients) {
       session_id: state.session.id,
       steps,
       params: state.params,
+      step_modes: state.stepModes,
       patient_id: patientId,
       post_tips_mode: $("postTipsMode").value,
       export_png: $("exportPng").checked,
@@ -315,11 +338,29 @@ async function refreshData() {
     const res = await fetch(`/api/session/${state.session.id}/data?patient=${encodeURIComponent(patient)}&section_stride=${stride}`);
     const data = await readResponse(res);
     state.data = data;
+    renderStepAvailability();
     renderScene();
     renderInspector();
   } catch (err) {
     showError(err);
   }
+}
+
+function renderStepAvailability() {
+  const status = state.data?.step_files || {};
+  STEPS.forEach(([key]) => {
+    const row = document.querySelector(`[data-step-item="${key}"]`);
+    const select = document.querySelector(`[data-step-mode="${key}"]`);
+    const step = status[key];
+    if (!row || !select) return;
+    const reuse = state.stepModes[key] === "reuse";
+    const ready = Boolean(step?.ready);
+    row.classList.toggle("reuse-mode", reuse);
+    row.classList.toggle("missing-reuse", reuse && !ready);
+    select.title = ready
+      ? "已找到该步骤保存的中间结果"
+      : "未找到该步骤需要的中间结果文件";
+  });
 }
 
 function renderScene() {

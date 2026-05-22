@@ -86,13 +86,13 @@ STEP_LABELS = {
 
 DEFAULT_PARAMS = {
     "pitch": 0.5,
-    "min_branch_length_mm": 8.0,
+    "min_branch_length_mm": 10.0,
     "min_relative_length": 0.05,
     "min_radius_ratio": 0.4,
     "keep_radius_ratio": 0.55,
-    "absolute_min_branch_length_mm": 3.0,
-    "absolute_min_radius_mm": 0.75,
-    "merge_bp_distance_mm": 5.0,
+    "absolute_min_branch_length_mm": 5.0,
+    "absolute_min_radius_mm": 1.0,
+    "merge_bp_distance_mm": 6.0,
     "n_fit_points": 10,
     "n_profile_points": 100,
     "curvature_window": 7,
@@ -116,6 +116,15 @@ OUTPUT_FILES = [
     "centerline_screenshot.png",
     "segment_screenshot.png",
 ]
+
+STEP_OUTPUTS = {
+    "centerline": ["CenterlinePoints.txt"],
+    "smooth": ["newCenterlist.txt"],
+    "segment": ["centerline_profiles.json"],
+    "profiles": ["centerline_pointwise_profiles.json"],
+    "features": ["unified_features.json"],
+    "export": ["vis_interactive.html"],
+}
 
 SESSIONS: dict[str, dict] = {}
 JOBS: dict[str, dict] = {}
@@ -856,6 +865,7 @@ def build_visualization_data(stl_path: Path, section_stride: int = 10, max_faces
         "pointwise": pointwise_layers,
         "features": _load_feature_blocks(parent),
         "files": _available_outputs(parent),
+        "step_files": _step_file_status(parent),
     })
 
 
@@ -870,6 +880,36 @@ def _available_outputs(parent: Path) -> list[dict]:
                 "modified": p.stat().st_mtime,
             })
     return files
+
+
+def _step_file_status(parent: Path) -> dict:
+    status = {}
+    for step, names in STEP_OUTPUTS.items():
+        files = []
+        for name in names:
+            p = parent / name
+            files.append({
+                "name": name,
+                "exists": p.exists(),
+                "size": p.stat().st_size if p.exists() else 0,
+                "modified": p.stat().st_mtime if p.exists() else None,
+            })
+        status[step] = {
+            "ready": all(item["exists"] for item in files),
+            "files": files,
+        }
+    return status
+
+
+def _reuse_pipeline_step(step: str, stl_path: Path):
+    required = STEP_OUTPUTS.get(step) or []
+    missing = [name for name in required if not (stl_path.parent / name).exists()]
+    if missing:
+        raise FileNotFoundError(
+            f"Cannot import saved result for {STEP_LABELS.get(step, step)}; "
+            f"missing: {', '.join(missing)}"
+        )
+    print(f"Reused saved result for {STEP_LABELS.get(step, step)}: {', '.join(required)}")
 
 
 def _create_session_single(fields) -> dict:
@@ -932,7 +972,7 @@ def _create_session_batch(payload: dict) -> dict:
     return session
 
 
-def _new_job(session_id: str, steps: list[str], patients: list[dict]) -> dict:
+def _new_job(session_id: str, steps: list[str], patients: list[dict], step_modes: dict | None = None) -> dict:
     job_id = uuid.uuid4().hex[:12]
     total = max(1, len(steps) * len(patients))
     job = {
@@ -942,6 +982,7 @@ def _new_job(session_id: str, steps: list[str], patients: list[dict]) -> dict:
         "created": _now(),
         "updated": _now(),
         "steps": steps,
+        "step_modes": step_modes or {},
         "total": total,
         "completed": 0,
         "current": "",
@@ -975,6 +1016,7 @@ def _run_job(job_id: str, params: dict, post_tips_mode: str, export_png: bool):
         session = SESSIONS[job["session_id"]]
         patients = list(job.get("_patients_runtime", []))
         steps = list(job["steps"])
+        step_modes = dict(job.get("step_modes") or {})
         job.pop("_patients_runtime", None)
     try:
         for patient in patients:
@@ -988,7 +1030,10 @@ def _run_job(job_id: str, params: dict, post_tips_mode: str, export_png: bool):
                 err_msg = None
                 try:
                     with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
-                        _run_pipeline_step(step, stl_path, params, post_tips_mode, export_png)
+                        if step_modes.get(step) == "reuse":
+                            _reuse_pipeline_step(step, stl_path)
+                        else:
+                            _run_pipeline_step(step, stl_path, params, post_tips_mode, export_png)
                 except Exception as exc:
                     ok = False
                     err_msg = f"{type(exc).__name__}: {exc}"
@@ -1227,6 +1272,11 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         steps = [s for s in steps if s in PIPELINE_STEPS]
         if not steps:
             raise ValueError("No valid pipeline steps selected.")
+        raw_step_modes = payload.get("step_modes") or {}
+        step_modes = {
+            s: "reuse" if raw_step_modes.get(s) == "reuse" else "recompute"
+            for s in steps
+        }
         params = _merge_params(payload.get("params"))
         post_tips_mode = payload.get("post_tips_mode") or "auto"
         export_png = bool(payload.get("export_png", False))
@@ -1237,7 +1287,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             patients = [patient] if patient else []
         if not patients:
             raise ValueError("No patients selected.")
-        job = _new_job(session_id, steps, patients)
+        job = _new_job(session_id, steps, patients, step_modes=step_modes)
         with STATE_LOCK:
             job["_patients_runtime"] = patients
             session["params"] = params

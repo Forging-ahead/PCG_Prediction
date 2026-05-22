@@ -412,7 +412,9 @@ def _shape_score(area, aspect_ratio, circularity):
     """
     elong_pen = 1.0 + 1.5 * max(0.0, aspect_ratio - 1.3)
     irreg_pen = 1.0 + (1.0 - min(1.0, max(0.0, circularity)))
-    return float(area) * elong_pen * irreg_pen
+    # Lower is better: prefer large, compact sections while still penalizing
+    # elongated or ragged branch-contaminated candidates.
+    return float(elong_pen * irreg_pen / max(float(area), 1e-9))
 
 
 def _compute_cross_section(mesh, point, normal,
@@ -880,6 +882,7 @@ def _extract_branch_raw_profile(branch_path, nodes, mesh,
 
     n_success = 0
     n_rejected = 0
+    n_relaxed_bounds = 0
     for idx in indices:
         # 局部允许的截面等效直径上限: inscribed_factor × 内切直径
         r_loc = radius_for_filter[idx]
@@ -892,6 +895,21 @@ def _extract_branch_raw_profile(branch_path, nodes, mesh,
             ownership_factor=ownership_factor,
             return_raw=True,
             return_extras=True)
+        if a <= 0 and (max_eq_d is not None or min_eq_d is not None):
+            # The signed-distance radius is a useful prior, but it can be too
+            # small when a point is off-center or close to a topology change.
+            # Retry without diameter bounds and let shape/outlier filters judge
+            # the section instead of collapsing the entire profile to zeros.
+            relaxed = _compute_cross_section(
+                mesh, coords[idx], tangents[idx],
+                max_eq_diameter=None,
+                min_eq_diameter=None,
+                ownership_factor=ownership_factor,
+                return_raw=True,
+                return_extras=True)
+            if relaxed[0] > 0:
+                a, p, raw_a, raw_p, anchor_r, owned_r, ncomp, sol = relaxed
+                n_relaxed_bounds += 1
         area[idx] = a
         perimeter[idx] = p
         raw_area[idx] = raw_a
@@ -937,6 +955,8 @@ def _extract_branch_raw_profile(branch_path, nodes, mesh,
         owned_radius[sampled_idx[zeroed]] = 0.0
         solidity[sampled_idx[zeroed]] = 0.0
         n_components[sampled_idx[zeroed]] = 0
+
+    n_final_success = int(np.sum(area[sampled_idx] > 0))
 
     # 对跳过的点插值 (仅对成功截面插值, 0 值不插)
     if section_step > 1 and n_success >= 2:
@@ -999,7 +1019,9 @@ def _extract_branch_raw_profile(branch_path, nodes, mesh,
         'inscribed_radius': inscribed_radius,
         '_n_sampled': len(indices),
         '_n_success': n_success,
+        '_n_final_success': n_final_success,
         '_n_rejected_oversize': n_rejected,
+        '_n_relaxed_bounds': int(n_relaxed_bounds),
         '_n_local_outliers': int(n_outliers),
         '_n_rate_outliers': int(n_rate_outliers),
     }
@@ -1279,6 +1301,7 @@ def _resample_profile(raw_profile, n_points=100):
     # 用 area > 0 作为"截面成功"的掩码
     area_arr = np.asarray(raw_profile['area'])
     success_mask = area_arr > 0
+    n_success = int(np.sum(success_mask))
 
     available_keys = section_keys | geometry_keys | integer_keys | nanable_keys
     available_keys = {k for k in available_keys if k in raw_profile}
@@ -1288,7 +1311,7 @@ def _resample_profile(raw_profile, n_points=100):
         try:
             if key in section_keys:
                 # 只用截面成功的原始点插值
-                if np.sum(success_mask) >= 2:
+                if n_success >= 2:
                     t_valid = t_raw[success_mask]
                     v_valid = values[success_mask]
                     # 去重 (单调要求)
@@ -1298,11 +1321,13 @@ def _resample_profile(raw_profile, n_points=100):
                                  bounds_error=False,
                                  fill_value=(v_c[0], v_c[-1]))
                     resampled = np.clip(f(t_uniform), 0, None)
+                elif n_success == 1:
+                    resampled = np.full(n_points, float(values[success_mask][0]))
                 else:
-                    resampled = np.zeros(n_points)
+                    resampled = np.full(n_points, np.nan)
             elif key in integer_keys:
                 # 离散整数: 用最近邻插值 (取整) + 端点延拓
-                if np.sum(success_mask) >= 2:
+                if n_success >= 2:
                     t_valid = t_raw[success_mask]
                     v_valid = values[success_mask]
                     mask = np.concatenate(([True], np.diff(t_valid) > 1e-10))
@@ -1311,8 +1336,10 @@ def _resample_profile(raw_profile, n_points=100):
                                  bounds_error=False,
                                  fill_value=(v_c[0], v_c[-1]))
                     resampled = np.clip(f(t_uniform), 0, None)
+                elif n_success == 1:
+                    resampled = np.full(n_points, float(values[success_mask][0]))
                 else:
-                    resampled = np.zeros(n_points)
+                    resampled = np.full(n_points, np.nan)
             elif key in nanable_keys:
                 # NaN-aware: 跳过 NaN 做线性插值, 不可信处仍保留 NaN
                 finite = np.isfinite(values)
@@ -1442,6 +1469,7 @@ def extract_profiles(stl_path, n_points=100, pitch=0.5,
     n_total_junction_protected = 0
     n_total_junction_replaced = 0
     n_total_rejected_oversize = 0
+    n_total_relaxed_bounds = 0
     n_total_local_outliers = 0
     n_total_rate_outliers = 0
     n_total_implausibly_small = 0
@@ -1471,6 +1499,8 @@ def extract_profiles(stl_path, n_points=100, pitch=0.5,
 
             n_total_rejected_oversize += raw_profile.get(
                 '_n_rejected_oversize', 0)
+            n_total_relaxed_bounds += raw_profile.get(
+                '_n_relaxed_bounds', 0)
             n_total_local_outliers += raw_profile.get(
                 '_n_local_outliers', 0)
             n_total_rate_outliers += raw_profile.get(
@@ -1504,6 +1534,10 @@ def extract_profiles(stl_path, n_points=100, pitch=0.5,
             # 透传过滤元信息
             resampled['n_rejected_oversize'] = int(
                 raw_profile.get('_n_rejected_oversize', 0))
+            resampled['n_relaxed_bounds'] = int(
+                raw_profile.get('_n_relaxed_bounds', 0))
+            resampled['n_section_success_final'] = int(
+                raw_profile.get('_n_final_success', 0))
             resampled['n_local_outliers'] = int(
                 raw_profile.get('_n_local_outliers', 0))
             resampled['n_rate_outliers'] = int(
@@ -1537,6 +1571,7 @@ def extract_profiles(stl_path, n_points=100, pitch=0.5,
         'n_total_junction_protected': int(n_total_junction_protected),
         'n_total_junction_replaced': int(n_total_junction_replaced),
         'n_total_rejected_oversize': int(n_total_rejected_oversize),
+        'n_total_relaxed_bounds': int(n_total_relaxed_bounds),
         'n_total_local_outliers': int(n_total_local_outliers),
         'n_total_rate_outliers': int(n_total_rate_outliers),
         'n_total_implausibly_small_sections': int(n_total_implausibly_small),

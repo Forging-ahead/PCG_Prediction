@@ -211,7 +211,8 @@ def _process_one_patient(stl_path, post_tips, params, steps):
 
 def process_stl_files(root_folder, params, steps,
                        stl_name="vessel.stl",
-                       clean_old=True):
+                       clean_old=True,
+                       skip_existing_results=False):
     """
     批量处理 root_folder 下所有合法子文件夹的 vessel.stl。
 
@@ -263,6 +264,7 @@ def process_stl_files(root_folder, params, steps,
         'features_ok': 0,
         'profiles_ok': 0,
         'export_vis_ok': 0,
+        'skipped_existing': 0,
     }
 
     for folder in valid:
@@ -280,6 +282,17 @@ def process_stl_files(root_folder, params, steps,
         print(f"\n{'='*60}")
         print(f"处理: {folder}   [{tag}]")
         print(f"{'='*60}")
+
+        if skip_existing_results:
+            result_files = ("unified_features.json", "unified_feature.json")
+            existing_result = next(
+                (name for name in result_files
+                 if os.path.exists(os.path.join(folder_path, name))),
+                None)
+            if existing_result:
+                print(f"[Skip] {folder}: existing result file {existing_result}")
+                summary['skipped_existing'] += 1
+                continue
 
         if clean_old:
             _clean_old_outputs(folder_path)
@@ -371,7 +384,7 @@ def run_correlation_analysis(root_folder, target="PVP",
 DEFAULT_PARAMS = {
     # 中心线提取
     'pitch': 0.5,
-    'min_branch_length_mm': 8.0,
+    'min_branch_length_mm': 10.0,
     'min_relative_length': 0.05,
     'min_radius_ratio': 0.4,
     'keep_radius_ratio': 0.55,       # 保护门: r_branch/r_junction ≥ 0.55 时
@@ -384,7 +397,7 @@ DEFAULT_PARAMS = {
 
     # 特征 / 剖面
     'n_fit_points': 10,
-    'n_profile_points': 100,
+    'n_profile_points': 200,
     'curvature_window': 7,
     'sample_step': 3,
     'ownership_factor': 1.8,        # 中心线锚定最大内切半径裁剪倍数:
@@ -406,7 +419,7 @@ if __name__ == '__main__':
     # 用户配置
     # ============================================
 
-    ROOT_FOLDER = r"E:\zhengzhou_vkan3"
+    ROOT_FOLDER = r"F:\PCG data\dataset\test4all_sample"
 
     # 跨患者相关性分析的目标量 ("PVP" 或 "PCG")
     TARGET = "PVP"
@@ -425,9 +438,12 @@ if __name__ == '__main__':
     steps.extract_features = True
     steps.extract_profiles = True
     steps.export_visualization = True   # 导出 HTML + PNG
-    steps.visualize = True              # VTK 弹窗 (批量时建议关掉)
+    steps.visualize = False              # VTK 弹窗 (批量时建议关掉)
 
     # 参数
+    # True: sample folder has unified_features.json/unified_feature.json -> skip
+    SKIP_EXISTING_RESULTS = False
+
     params = dict(DEFAULT_PARAMS)
     # 例: params['min_branch_length_mm'] = 10.0
 
@@ -447,7 +463,8 @@ if __name__ == '__main__':
             params=params,
             steps=steps,
             stl_name="vessel.stl",
-            clean_old=True)
+            clean_old=True,
+            skip_existing_results=SKIP_EXISTING_RESULTS)
 
     if MODE in ("all", "correlate"):
         run_correlation_analysis(
