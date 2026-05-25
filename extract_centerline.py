@@ -7,18 +7,18 @@
       → BFS建树
 
 新增剪枝策略:
-  (-1) **硬阈值 (新)**: 末端分支极短 (< absolute_min_branch_length_mm) 或
-       极细 (max_radius < absolute_min_radius_mm) → 无条件剪除. 即使其半径
-       占比看起来很大也按噪声处理 (skeletonization 在曲面凸起处的毛刺).
+  (-1) **硬阈值**: 末端分支极短 (< absolute_min_branch_length_mm), 或
+       "短且极细" → 视为噪声毛刺. 极细但足够长的分支会被保留, 避免真实
+       细血管被半径阈值误删.
   (0) **保护门 (新)**: 末端分支最大半径 / 父主干半径 ≥ keep_radius_ratio
        → 视为真实分支, 跳过所有长度/相对长度判据.
        目的: 避免短-但-粗 的真实小分支被长度阈值误剪
        (Murray 定律下子血管半径 ≈ 0.6~0.8 × 父血管, 远高于噪声毛刺 0.1~0.2)
        注: branch_max_radius 计算**必须排除 junction 节点**, 否则距离变换
        在分叉点处会把主干体积算进去, 使保护门对所有毛刺都误触发.
-  (1) 物理长度阈值: 末端分支弧长 < min_branch_length_mm 剪除
-  (2) 相对长度阈值: 末端分支弧长 < total_length × min_relative_length 剪除
-  (3) 半径判据: 末端分支最大半径 < 父主干半径 × min_radius_ratio 剪除
+  (1) 物理长度阈值: 末端分支弧长 < min_branch_length_mm 且半径占比低时剪除
+  (2) 相对长度阈值: 末端分支弧长 < total_length × min_relative_length 且半径占比低时剪除
+  (3) 半径判据: 半径占比低只作为毛刺证据, 需结合短分支/相对短分支才剪除
   (4) 近邻 bp 合并: 两个 bp 距离 < merge_bp_distance_mm 时合并
   (5) 迭代到稳定
 
@@ -41,10 +41,12 @@ def extract_centerline(stl_path, output_txt_path=None,
                        min_relative_length=0.05,
                        min_radius_ratio=0.4,
                        keep_radius_ratio=0.55,
-                       absolute_min_branch_length_mm=5.0,
-                       absolute_min_radius_mm=1.0,
+                       absolute_min_branch_length_mm=3.0,
+                       absolute_min_radius_mm=0.5,
                        merge_bp_distance_mm=6.0,
                        max_prune_iterations=20,
+                       regularize_binary=True,
+                       auto_refine_thin=True,
                        verbose=True):
     """
     从STL文件提取中心线 (含增强剪枝)。
@@ -54,11 +56,11 @@ def extract_centerline(stl_path, output_txt_path=None,
         output_txt_path:        输出路径, 默认 CenterlinePoints.txt
         pitch:                  体素化分辨率(mm)
         min_branch_length_mm:   末端分支最小物理长度阈值(mm)
-                                小于此值的末端分支被视为噪声剪除
+                                小于此值且半径占比低的末端分支被视为噪声剪除
         min_relative_length:    末端分支相对总长度的最小比例
-                                小于此比例的末端分支也被剪除
+                                小于此比例且半径占比低的末端分支也被剪除
         min_radius_ratio:       末端分支最大半径 / 主干半径 的最小比例
-                                小于此比例的末端分支视为表面凸起剪除
+                                小于此比例时作为表面凸起证据之一
                                 (区分真细血管 vs 表面凸起)
         keep_radius_ratio:      "保护门"阈值. 末端分支最大半径 / 主干半径
                                 ≥ 该值时, 跳过所有长度判据直接保留.
@@ -69,22 +71,75 @@ def extract_centerline(stl_path, output_txt_path=None,
                                 **硬剪阈值**, 默认 3.0mm. 末端分支弧长 < 此值
                                 必为骨架毛刺 (1~5 体素的表面凸起), 直接剪除,
                                 **跳过保护门**. 真血管分支不会短于 3mm.
-        absolute_min_radius_mm: **硬剪阈值**, 默认 0.75mm. 末端分支最大半径
-                                (排除 junction) < 此值必为噪声 (相当于 ≤ 1.5
-                                体素厚度的凸起), 直接剪除. 真血管即使细如
-                                LGV/PGV, 半径也 ≥ 1mm.
+        absolute_min_radius_mm: 极细毛刺参考阈值. 只在分支也很短时参与硬剪,
+                                不再单独删除长的真实细血管。
         merge_bp_distance_mm:   两个分支点距离小于此值时合并
         max_prune_iterations:   剪枝最大迭代次数
+        regularize_binary:      骨架化前做轻量体素正则化, 去掉单体素毛刺并补小孔。
+        auto_refine_thin:       骨架为空/剪枝后为空时自动用更小 pitch 重试。
         verbose:                打印进度
 
     返回:
         centerline_tree: list of [ID, x, y, z, parentID, leftChildID, rightChildID]
     """
+    last_error = None
+    attempt_pitches = _centerline_pitch_attempts(pitch, auto_refine_thin)
+
+    for attempt_idx, attempt_pitch in enumerate(attempt_pitches):
+        retry_note = "" if attempt_idx == 0 else " (细血管兜底重试)"
+        try:
+            centerline_tree = _extract_centerline_once(
+                stl_path,
+                output_txt_path=output_txt_path,
+                pitch=attempt_pitch,
+                min_branch_length_mm=min_branch_length_mm,
+                min_relative_length=min_relative_length,
+                min_radius_ratio=min_radius_ratio,
+                keep_radius_ratio=keep_radius_ratio,
+                absolute_min_branch_length_mm=absolute_min_branch_length_mm,
+                absolute_min_radius_mm=absolute_min_radius_mm,
+                merge_bp_distance_mm=merge_bp_distance_mm,
+                max_prune_iterations=max_prune_iterations,
+                regularize_binary=regularize_binary,
+                verbose=verbose,
+                retry_note=retry_note)
+            return centerline_tree
+        except ValueError as e:
+            last_error = e
+            if (not auto_refine_thin or
+                    attempt_idx == len(attempt_pitches) - 1 or
+                    not _is_retryable_centerline_error(e)):
+                raise
+            if verbose:
+                print(f"       [warn] {e}; 改用 pitch={attempt_pitches[attempt_idx+1]:.3f}mm 重试")
+
+    if last_error is not None:
+        raise last_error
+    raise ValueError("中心线提取失败")
+
+
+def _extract_centerline_once(stl_path, output_txt_path=None,
+                             pitch=0.5,
+                             min_branch_length_mm=10.0,
+                             min_relative_length=0.05,
+                             min_radius_ratio=0.4,
+                             keep_radius_ratio=0.55,
+                             absolute_min_branch_length_mm=3.0,
+                             absolute_min_radius_mm=0.5,
+                             merge_bp_distance_mm=6.0,
+                             max_prune_iterations=20,
+                             regularize_binary=True,
+                             verbose=True,
+                             retry_note=""):
+    """执行一次中心线提取；外层负责失败重试。"""
     if verbose:
-        print(f"\n[1/6] 体素化STL: {os.path.basename(stl_path)}")
+        print(f"\n[1/6] 体素化STL: {os.path.basename(stl_path)}{retry_note}")
     binary, origin, pitch = voxelize_stl(stl_path, pitch)
     if np.sum(binary) == 0:
         raise ValueError("体素化结果为空")
+
+    if regularize_binary:
+        binary = _regularize_binary_for_skeleton(binary, verbose=verbose)
 
     if verbose:
         print("[2/6] 距离变换...")
@@ -112,6 +167,8 @@ def extract_centerline(stl_path, output_txt_path=None,
         G = G.subgraph(largest_cc).copy()
     if verbose:
         print(f"       图节点数: {G.number_of_nodes()}")
+    if G.number_of_nodes() == 0:
+        raise ValueError("骨架图为空")
 
     if verbose:
         print(f"[5/6] 增强剪枝 (min_L={min_branch_length_mm}mm, "
@@ -133,6 +190,8 @@ def extract_centerline(stl_path, output_txt_path=None,
         eps = sum(1 for n in G.nodes() if G.degree(n) == 1)
         bps = sum(1 for n in G.nodes() if G.degree(n) >= 3)
         print(f"       端点: {eps}, 分支点: {bps}")
+    if G.number_of_nodes() == 0:
+        raise ValueError("剪枝后中心线为空")
 
     # ----- 第6步: BFS 建树, 输出物理坐标 -----
     if verbose:
@@ -171,6 +230,65 @@ def extract_centerline(stl_path, output_txt_path=None,
         print(f"       已保存: {output_txt_path}")
 
     return centerline_tree
+
+
+def _centerline_pitch_attempts(pitch, auto_refine_thin):
+    """生成中心线提取的 pitch 尝试序列。"""
+    base = float(pitch)
+    attempts = [base]
+    if auto_refine_thin:
+        for factor in (0.75, 0.5):
+            p = round(base * factor, 4)
+            if p > 0 and all(abs(p - old) > 1e-6 for old in attempts):
+                attempts.append(p)
+    return attempts
+
+
+def _is_retryable_centerline_error(error):
+    """判断是否值得用更小 pitch 重试。"""
+    msg = str(error)
+    retry_markers = (
+        "体素化结果为空",
+        "骨架化结果为空",
+        "骨架图为空",
+        "剪枝后中心线为空",
+    )
+    return any(marker in msg for marker in retry_markers)
+
+
+def _regularize_binary_for_skeleton(binary, verbose=True):
+    """
+    骨架化前的轻量体素正则化。
+
+    先闭运算/补孔, 降低单体素缺口对拓扑的影响; 再尝试一次 6 邻域开运算
+    去掉表面小凸起。若开运算会破坏太多体素, 说明模型本身偏细, 自动退回到
+    只闭运算的结果, 避免把真实细血管抹掉。
+    """
+    binary_bool = binary.astype(bool)
+    original_count = int(np.sum(binary_bool))
+    if original_count == 0:
+        return binary
+
+    structure = ndimage.generate_binary_structure(3, 1)
+    closed = ndimage.binary_closing(binary_bool, structure=structure, iterations=1)
+    closed = ndimage.binary_fill_holes(closed)
+
+    opened = ndimage.binary_opening(closed, structure=structure, iterations=1)
+    closed_count = int(np.sum(closed))
+    opened_count = int(np.sum(opened))
+    retained = opened_count / max(closed_count, 1)
+
+    if opened_count > 0 and retained >= 0.85:
+        result = opened
+        action = "闭运算+保守开运算"
+    else:
+        result = closed
+        action = "闭运算"
+
+    if verbose:
+        print(f"       体素正则化: {action}, "
+              f"{original_count} -> {int(np.sum(result))} 体素")
+    return result.astype(np.uint8)
 
 
 # ============================================================
@@ -230,10 +348,10 @@ def _enhanced_prune(G, id_to_point, id_to_radius, pitch,
 
     每轮:
       a) 找所有末端分支(从端点沿度=2 节点走到下一个度!=2 节点)
-      b) **硬阈值**: 极短或极细分支 (低于绝对阈值) 无条件剪除, 跳过保护门
+      b) **硬阈值**: 极短或短且极细分支剪除, 跳过保护门
       c) **保护门**: 若分支最大半径 / 主干半径 ≥ keep_radius_ratio,
                      视为真实分支, 跳过该轮所有剪枝判据
-      d) 剪掉满足任一长度/半径判据的分支
+      d) 剪掉满足短分支 + 低半径占比判据的分支
       e) 合并近邻分支点
     直到稳定或达到最大迭代。
     """
@@ -286,18 +404,30 @@ def _enhanced_prune(G, id_to_point, id_to_radius, pitch,
             # 父主干半径(取分支点处的半径)
             junction_radius = id_to_radius[junction]
 
-            # ---- (-1) 硬阈值: 极短 / 极细 → 必为噪声, 跳过保护门强剪 ----
+            radius_ratio = (branch_median_radius / junction_radius
+                            if junction_radius > 1e-6 else 1.0)
+
+            # ---- (-1) 硬阈值: 极短, 或"短且极细" → 噪声毛刺 ----
+            # 旧逻辑只要半径低于 absolute_min_radius_mm 就强剪, 会把 LGV/PGV
+            # 等真实细血管一起删掉。这里把半径阈值改为毛刺证据之一:
+            # 细血管可以细, 但不应同时短到只像表面凸起。
             absolute_short = branch_length < absolute_min_branch_length_mm
             absolute_thin = branch_max_radius < absolute_min_radius_mm
+            short_thin_spur = (
+                absolute_thin and
+                branch_length < max(min_branch_length_mm,
+                                    2.0 * absolute_min_branch_length_mm)
+            )
+            radius_too_small = radius_ratio < min_radius_ratio
 
             # ---- (0) 保护门: 半径占比足够大 → 视为真实分支, 不剪 ----
             # 即使分支较短, 只要其管径相对于分叉处足够粗, 物理上不可能是
             # 表面噪声毛刺 (skeletonization spur 的 r_max 通常 ≤ 1~2 个体素),
             # 真分支应当保留以免后续解剖分段缺失.
-            # 注: 硬阈值 (极短/极细) 优先, 不进保护门.
-            if (not absolute_short and not absolute_thin and
+            # 注: 硬阈值 (极短/短且极细) 优先, 不进保护门.
+            if (not absolute_short and not short_thin_spur and
                     junction_radius > 1e-6 and
-                    branch_median_radius / junction_radius >= keep_radius_ratio):
+                    radius_ratio >= keep_radius_ratio):
                 n_kept_thick_this_round += 1
                 continue
 
@@ -309,23 +439,20 @@ def _enhanced_prune(G, id_to_point, id_to_radius, pitch,
                 should_prune = True
                 reason = (f"极短(L={branch_length:.2f}mm, "
                           f"硬阈值 {absolute_min_branch_length_mm}mm)")
-            elif absolute_thin:
+            elif short_thin_spur:
                 should_prune = True
-                reason = (f"极细(r={branch_max_radius:.2f}mm, "
-                          f"硬阈值 {absolute_min_radius_mm}mm)")
-            elif branch_length < min_branch_length_mm:
+                reason = (f"短且极细(L={branch_length:.1f}mm, "
+                          f"r={branch_max_radius:.2f}mm)")
+            elif branch_length < min_branch_length_mm and radius_too_small:
                 should_prune = True
-                reason = f"短(L={branch_length:.1f}mm)"
-            elif branch_length < total_edge_length * min_relative_length:
+                reason = (f"短且细(L={branch_length:.1f}mm, "
+                          f"ratio={radius_ratio:.2f})")
+            elif (branch_length < total_edge_length * min_relative_length and
+                  radius_too_small):
                 should_prune = True
                 reason = (f"相对短(L={branch_length:.1f}mm < "
-                          f"{100*min_relative_length:.0f}%)")
-            elif (junction_radius > 1e-6 and
-                  branch_median_radius / junction_radius < min_radius_ratio):
-                should_prune = True
-                reason = (f"细(r_branch={branch_max_radius:.2f}mm, "
-                          f"r_junction={junction_radius:.2f}mm, "
-                          f"ratio={branch_median_radius/junction_radius:.2f})")
+                          f"{100*min_relative_length:.0f}%, "
+                          f"ratio={radius_ratio:.2f})")
 
             if should_prune:
                 # 剪除分支(不剪 junction 本身)

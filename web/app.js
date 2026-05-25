@@ -4,9 +4,9 @@ const DEFAULT_PARAMS = {
   min_relative_length: 0.05,
   min_radius_ratio: 0.4,
   keep_radius_ratio: 0.55,
-  absolute_min_branch_length_mm: 5.0,
-  absolute_min_radius_mm: 1.0,
-  merge_bp_distance_mm: 6.0,
+  absolute_min_branch_length_mm: 3.0,
+  absolute_min_radius_mm: 0.5,
+  merge_bp_distance_mm: 5.0,
   n_fit_points: 10,
   n_profile_points: 100,
   curvature_window: 7,
@@ -56,6 +56,19 @@ const LAYERS = {
   labels: true,
 };
 
+const CENTERLINE_EDIT_COLORS = [
+  "#d9822b",
+  "#7c3aed",
+  "#0f9f6e",
+  "#e11d48",
+  "#2563eb",
+  "#ca8a04",
+  "#0891b2",
+  "#db2777",
+  "#65a30d",
+  "#9333ea",
+];
+
 const state = {
   mode: "single",
   session: null,
@@ -65,6 +78,10 @@ const state = {
   layers: { ...LAYERS },
   job: null,
   pollTimer: null,
+  centerlineEdit: {
+    active: false,
+    selected: new Set(),
+  },
 };
 
 const $ = (id) => document.getElementById(id);
@@ -73,6 +90,7 @@ function init() {
   buildStepButtons();
   buildParamInputs();
   bindEvents();
+  renderCenterlineEditControls();
   checkHealth();
 }
 
@@ -90,6 +108,11 @@ function bindEvents() {
   });
   $("sectionStride").addEventListener("change", refreshData);
   $("meshOpacity").addEventListener("input", () => renderScene());
+  $("centerlineEditBtn").addEventListener("click", toggleCenterlineEdit);
+  $("centerlinePickBtn").addEventListener("click", toggleSelectedCenterlineBranch);
+  $("centerlineBranchSelect").addEventListener("change", renderCenterlineEditControls);
+  $("centerlineUndoBtn").addEventListener("click", clearCenterlineSelection);
+  $("centerlineSaveBtn").addEventListener("click", saveCenterlineDeletion);
 
   document.querySelectorAll(".layer-toggle").forEach((input) => {
     input.addEventListener("change", () => {
@@ -338,9 +361,11 @@ async function refreshData() {
     const res = await fetch(`/api/session/${state.session.id}/data?patient=${encodeURIComponent(patient)}&section_stride=${stride}`);
     const data = await readResponse(res);
     state.data = data;
+    reconcileCenterlineSelection();
     renderStepAvailability();
     renderScene();
     renderInspector();
+    renderCenterlineEditControls();
   } catch (err) {
     showError(err);
   }
@@ -361,6 +386,141 @@ function renderStepAvailability() {
       ? "已找到该步骤保存的中间结果"
       : "未找到该步骤需要的中间结果文件";
   });
+}
+
+function currentPatientId() {
+  const selected = $("patientSelect").value;
+  return selected === "all" ? state.session?.patients?.[0]?.id : selected;
+}
+
+function toggleCenterlineEdit() {
+  state.centerlineEdit.active = !state.centerlineEdit.active;
+  if (state.centerlineEdit.active) {
+    state.layers.rawCenterline = true;
+    const rawToggle = document.querySelector('.layer-toggle[data-layer="rawCenterline"]');
+    if (rawToggle) rawToggle.checked = true;
+  } else {
+    state.centerlineEdit.selected.clear();
+  }
+  renderScene();
+  renderCenterlineEditControls();
+}
+
+function clearCenterlineSelection() {
+  state.centerlineEdit.selected.clear();
+  renderScene();
+  renderCenterlineEditControls();
+}
+
+function centerlineBranchColor(index) {
+  return CENTERLINE_EDIT_COLORS[index % CENTERLINE_EDIT_COLORS.length];
+}
+
+function centerlineBranchLabel(branch, index) {
+  return `#${index + 1} 端点 ${branch.endpoint_id} → 分叉 ${branch.junction_id} · ${fmt(branch.length_mm, 1)} mm`;
+}
+
+function reconcileCenterlineSelection() {
+  const valid = new Set((state.data?.centerline_edit?.branches || []).map((item) => item.id));
+  for (const id of Array.from(state.centerlineEdit.selected)) {
+    if (!valid.has(id)) state.centerlineEdit.selected.delete(id);
+  }
+}
+
+function renderCenterlineEditControls() {
+  const branches = state.data?.centerline_edit?.branches || [];
+  const selected = state.centerlineEdit.selected.size;
+  const branchSelect = $("centerlineBranchSelect");
+  const previousValue = branchSelect.value;
+  branchSelect.innerHTML = "";
+  if (branches.length) {
+    branches.forEach((branch, index) => {
+      const option = document.createElement("option");
+      option.value = branch.id;
+      option.textContent = centerlineBranchLabel(branch, index);
+      option.style.color = centerlineBranchColor(index);
+      branchSelect.appendChild(option);
+    });
+    const validPrevious = branches.some((branch) => branch.id === previousValue);
+    branchSelect.value = validPrevious ? previousValue : branches[0].id;
+  } else {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = "无可删分支";
+    branchSelect.appendChild(option);
+  }
+  const chosenId = branchSelect.value;
+  const chosenIndex = branches.findIndex((branch) => branch.id === chosenId);
+  if (chosenIndex >= 0) {
+    branchSelect.style.borderColor = centerlineBranchColor(chosenIndex);
+  } else {
+    branchSelect.style.borderColor = "";
+  }
+  $("centerlineEditBtn").classList.toggle("active", state.centerlineEdit.active);
+  $("centerlineEditBtn").disabled = !state.session || !state.data?.centerlines?.raw;
+  branchSelect.disabled = !state.centerlineEdit.active || branches.length === 0;
+  $("centerlinePickBtn").disabled = !state.centerlineEdit.active || !chosenId;
+  $("centerlinePickBtn").textContent = chosenId && state.centerlineEdit.selected.has(chosenId)
+    ? "取消该段"
+    : "选择删除";
+  $("centerlineUndoBtn").disabled = !state.centerlineEdit.active || selected === 0;
+  $("centerlineSaveBtn").disabled = !state.centerlineEdit.active || selected === 0;
+  $("centerlineEditStatus").textContent = state.centerlineEdit.active
+    ? `可删 ${branches.length} 段 · 已选 ${selected}`
+    : `可删 ${branches.length} 段`;
+}
+
+function toggleSelectedCenterlineBranch() {
+  if (!state.centerlineEdit.active) return;
+  const branchId = $("centerlineBranchSelect").value;
+  if (!branchId) return;
+  toggleCenterlineBranchSelection(branchId);
+}
+
+function toggleCenterlineBranchSelection(branchId) {
+  if (state.centerlineEdit.selected.has(branchId)) {
+    state.centerlineEdit.selected.delete(branchId);
+  } else {
+    state.centerlineEdit.selected.add(branchId);
+  }
+  const branches = state.data?.centerline_edit?.branches || [];
+  const branch = branches.find((item) => item.id === branchId);
+  const index = branches.findIndex((item) => item.id === branchId);
+  $("pickedInfo").innerHTML = branch
+    ? `原始中心线分支<br>编号: #${index + 1}<br>端点: ${branch.endpoint_id}<br>分叉点: ${branch.junction_id}<br>长度: ${fmt(branch.length_mm, 2)} mm<br>状态: ${state.centerlineEdit.selected.has(branchId) ? "待删除" : "未选择"}`
+    : "原始中心线分支";
+  renderScene();
+}
+
+async function saveCenterlineDeletion() {
+  if (!state.session || state.centerlineEdit.selected.size === 0) return;
+  const patientId = currentPatientId();
+  if (!patientId) return;
+  setBusy(true);
+  try {
+    const branchIds = Array.from(state.centerlineEdit.selected);
+    const res = await fetchJson("/api/centerline/delete-branches", {
+      session_id: state.session.id,
+      patient_id: patientId,
+      branch_ids: branchIds,
+    });
+    const payload = await readResponse(res);
+    const removed = payload.result?.removed_nodes ?? 0;
+    const stale = payload.result?.removed_outputs || [];
+    logLine(`Deleted ${branchIds.length} centerline branch(es), removed ${removed} node(s).`);
+    if (stale.length) logLine(`Cleared derived outputs: ${stale.join(", ")}`);
+    state.centerlineEdit.selected.clear();
+    state.centerlineEdit.active = false;
+    state.stepModes.centerline = "reuse";
+    const centerlineMode = document.querySelector('[data-step-mode="centerline"]');
+    if (centerlineMode) centerlineMode.value = "reuse";
+    await refreshData();
+  } catch (err) {
+    showError(err);
+  } finally {
+    setBusy(false);
+    renderCenterlineEditControls();
+  }
 }
 
 function renderScene() {
@@ -389,8 +549,9 @@ function renderScene() {
     });
   }
 
-  addCenterlineTrace(traces, data.centerlines?.raw, "原始中心线", "#6b7280", state.layers.rawCenterline);
+  addCenterlineTrace(traces, data.centerlines?.raw, "原始中心线", "#6b7280", state.layers.rawCenterline || state.centerlineEdit.active);
   addCenterlineTrace(traces, data.centerlines?.smooth, "平滑中心线", "#111827", state.layers.smoothCenterline);
+  addEditableCenterlineTraces(traces, data.centerline_edit?.branches || []);
   addSegmentTraces(traces, data.segments || {});
   addBranchPointTrace(traces, data.branch_points || []);
   addFeaturePointTraces(traces, data.pointwise?.feature_points || {});
@@ -427,10 +588,46 @@ function renderScene() {
   }
   plot.on("plotly_click", (event) => {
     const pt = event.points?.[0];
+    if (handleCenterlineEditClick(pt)) return;
     if (pt?.customdata) {
       $("pickedInfo").innerHTML = escapeHtml(String(pt.customdata)).replaceAll("\n", "<br>").replaceAll("&lt;br&gt;", "<br>");
     }
   });
+  renderCenterlineEditControls();
+}
+
+function addEditableCenterlineTraces(traces, branches) {
+  if (!state.centerlineEdit.active || !branches.length) return;
+  branches.forEach((branch, index) => {
+    const selected = state.centerlineEdit.selected.has(branch.id);
+    const color = centerlineBranchColor(index);
+    traces.push({
+      type: "scatter3d",
+      mode: "lines",
+      name: selected ? `待删除 #${index + 1}` : `可删分支 #${index + 1}`,
+      x: branch.x,
+      y: branch.y,
+      z: branch.z,
+      customdata: branch.x.map(() => `centerline-edit:${branch.id}`),
+      line: {
+        color: selected ? "#b42318" : color,
+        width: selected ? 12 : 9,
+      },
+      opacity: selected ? 0.98 : 0.88,
+      hovertemplate: `#${index + 1}<br>端点 ${branch.endpoint_id} → 分叉点 ${branch.junction_id}<br>length: ${fmt(branch.length_mm, 2)} mm<extra></extra>`,
+    });
+  });
+}
+
+function handleCenterlineEditClick(point) {
+  const marker = point?.customdata;
+  if (!state.centerlineEdit.active || typeof marker !== "string" || !marker.startsWith("centerline-edit:")) {
+    return false;
+  }
+  const branchId = marker.slice("centerline-edit:".length);
+  $("centerlineBranchSelect").value = branchId;
+  toggleCenterlineBranchSelection(branchId);
+  return true;
 }
 
 function axisLayout(title) {

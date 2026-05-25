@@ -55,6 +55,12 @@ button:hover:not(:disabled) {
   color: #fff;
 }
 
+.danger-btn {
+  border-color: var(--danger);
+  background: #fff5f3;
+  color: var(--danger);
+}
+
 .app-shell {
   display: grid;
   grid-template-columns: 360px minmax(0, 1fr);
@@ -330,6 +336,34 @@ pre {
 
 .slider-group input {
   width: 120px;
+}
+
+.edit-group {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.edit-group select {
+  max-width: 260px;
+  min-height: 34px;
+  padding: 5px 8px;
+  border: 2px solid var(--line);
+  border-radius: 6px;
+  background: #fff;
+  color: var(--text);
+}
+
+.edit-group button.active {
+  border-color: var(--accent-2);
+  background: #fff7ed;
+  color: #7a3f12;
+}
+
+.edit-group span {
+  color: var(--muted);
+  font-size: 12px;
 }
 
 .viewer-wrap {

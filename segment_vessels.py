@@ -28,6 +28,8 @@
                        小 → LGV 代偿 (MPV 贯穿), 大 → PGV 代偿 (MPV = bp1→bp2)
   (9) PGV 代偿下 SV-distal vs PGV: 方向一致性 cos(SV入射, 候选出射)
                                    值大者 = SV-distal, 值小者 = PGV
+      并做 PGV 合理性质控: 若 PGV 分叉点过近 SV-SMV 汇合且候选过短,
+      降级为无代偿分段, 避免把汇合处短毛刺误标为 PGV.
 """
 
 import os
@@ -351,6 +353,51 @@ def _select_sv_distal_pgv(branches, sv_main_path, nodes, sample_dist=8.0):
     pgv = scored[1][1]
     print(f"    SV/PGV 方向一致性: SV={scored[0][0]:.3f}, PGV={scored[1][0]:.3f}")
     return sv_distal, pgv
+
+
+def _pgv_candidate_quality(pgv_seg, sv_distal_seg, sv_proximal,
+                           smv_seg, nodes):
+    """
+    判断 PGV 候选是否像真实代偿支。
+
+    这个门控只用于防止把 SV-SMV 汇合点附近的短小骨架支误标为 PGV。
+    真实 PGV 通常应从 SV 远端分出, 与汇合点有一定距离, 且长度不能只像
+    一个局部表面/端点伪分支。
+    """
+    if pgv_seg is None or len(pgv_seg) < 2:
+        return False, "无 PGV 候选"
+
+    pgv_len = path_physical_length(pgv_seg, nodes)
+    sv_distal_len = path_physical_length(sv_distal_seg, nodes) if sv_distal_seg else 0.0
+    sv_prox_len = path_physical_length(sv_proximal, nodes) if sv_proximal else 0.0
+    smv_len = path_physical_length(smv_seg, nodes) if smv_seg else 0.0
+
+    # PGV 分叉点离 SV-SMV 汇合太近时, 很容易是中心线拓扑毛刺或短端点。
+    near_confluence = sv_prox_len < 8.0
+
+    # 长度门限用相对值兜底, 避免固定阈值误杀整体较小的样本。
+    reference_len = max(sv_distal_len, smv_len, 1.0)
+    short_vs_system = pgv_len < max(10.0, 0.20 * reference_len)
+
+    # 若 PGV 比它竞争的 SV 远端短太多, 且起点就在汇合附近, 大概率不是
+    # 真实代偿血管, 而是本例图中这种被误分出的短支。
+    tiny_vs_sv = sv_distal_len > 1e-6 and pgv_len < 0.35 * sv_distal_len
+
+    if near_confluence and (short_vs_system or tiny_vs_sv):
+        return False, (
+            f"PGV 起点离 SV-SMV 汇合仅 {sv_prox_len:.1f}mm, "
+            f"且候选较短 {pgv_len:.1f}mm "
+            f"(SV远端 {sv_distal_len:.1f}mm, SMV {smv_len:.1f}mm)"
+        )
+
+    # 极短支即使不在汇合点附近, 也更像骨架毛刺。
+    if pgv_len < 6.0:
+        return False, f"PGV 候选过短 {pgv_len:.1f}mm"
+
+    return True, (
+        f"PGV 候选通过: L={pgv_len:.1f}mm, "
+        f"距汇合={sv_prox_len:.1f}mm"
+    )
 
 
 # ============================================================
@@ -811,6 +858,14 @@ def _build_pgv_segments(nodes, adj, endpoints, segments_raw,
     else:
         sv_seg = sv_proximal
 
+    pgv_ok, pgv_reason = _pgv_candidate_quality(
+        pgv_seg, sv_distal_seg, sv_proximal, smv_seg, nodes)
+    if pgv_ok:
+        print(f"    PGV质控: {pgv_reason}")
+    else:
+        print(f"    PGV质控: {pgv_reason} → 降级为无代偿分段")
+        pgv_seg = None
+
     print(f"    MPV: 肝侧={bp_mpv_end_liver} → SV交汇={bp_svjct}")
     print(f"    分支起点: LPV={lpv_seg[0] if lpv_seg else None}, "
           f"RPV={rpv_seg[0] if rpv_seg else None}")
@@ -820,8 +875,8 @@ def _build_pgv_segments(nodes, adj, endpoints, segments_raw,
             'mpv': mpv_seg, 'sv': sv_seg, 'smv': smv_seg,
             'lpv': lpv_seg, 'rpv': rpv_seg, 'pgv': pgv_seg,
         },
-        'has_compensation': True,
-        'compensation_type': 'PGV',
+        'has_compensation': bool(pgv_ok),
+        'compensation_type': 'PGV' if pgv_ok else None,
     }
 
 

@@ -391,8 +391,8 @@ DEFAULT_PARAMS = {
                                       # 视为真分支, 跳过所有长度判据
     'absolute_min_branch_length_mm': 3.0,  # 硬阈值: 弧长 < 3mm 必为骨架毛刺,
                                             # 跳过保护门强剪
-    'absolute_min_radius_mm': 0.75,        # 硬阈值: max_radius < 0.75mm
-                                            # (≤1.5 体素) 必为噪声, 强剪
+    'absolute_min_radius_mm': 0.5,         # 仅作为"短且极细"毛刺判据,
+                                            # 不再单独强剪真实细血管
     'merge_bp_distance_mm': 5.0,
 
     # 特征 / 剖面
@@ -435,9 +435,9 @@ if __name__ == '__main__':
     steps.extract_centerline = True
     steps.smooth_centerline = True
     steps.segment_vessels = True
-    steps.extract_features = True
-    steps.extract_profiles = True
-    steps.export_visualization = True   # 导出 HTML + PNG
+    steps.extract_features = False
+    steps.extract_profiles = False
+    steps.export_visualization = False   # 导出 HTML + PNG
     steps.visualize = False              # VTK 弹窗 (批量时建议关掉)
 
     # 参数

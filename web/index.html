@@ -110,6 +110,16 @@
           <span id="sectionStrideValue">10</span>
           <label>模型透明度 <input id="meshOpacity" type="range" min="0" max="80" value="22" /></label>
         </div>
+        <div class="edit-group">
+          <button id="centerlineEditBtn" type="button">编辑原始线</button>
+          <select id="centerlineBranchSelect" disabled>
+            <option value="">无可删分支</option>
+          </select>
+          <button id="centerlinePickBtn" type="button" disabled>选择删除</button>
+          <button id="centerlineUndoBtn" type="button" disabled>撤销选择</button>
+          <button id="centerlineSaveBtn" class="danger-btn" type="button" disabled>保存删除</button>
+          <span id="centerlineEditStatus">可删 0 段</span>
+        </div>
       </div>
 
       <section class="viewer-wrap">

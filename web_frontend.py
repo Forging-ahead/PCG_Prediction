@@ -29,6 +29,7 @@ import time
 import traceback
 import uuid
 import zipfile
+from collections import deque
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -90,9 +91,9 @@ DEFAULT_PARAMS = {
     "min_relative_length": 0.05,
     "min_radius_ratio": 0.4,
     "keep_radius_ratio": 0.55,
-    "absolute_min_branch_length_mm": 5.0,
-    "absolute_min_radius_mm": 1.0,
-    "merge_bp_distance_mm": 6.0,
+    "absolute_min_branch_length_mm": 3.0,
+    "absolute_min_radius_mm": 0.5,
+    "merge_bp_distance_mm": 5.0,
     "n_fit_points": 10,
     "n_profile_points": 100,
     "curvature_window": 7,
@@ -401,6 +402,241 @@ def _line_arrays_from_nodes(nodes: dict | None) -> dict | None:
             y.extend([node["y"], other["y"], None])
             z.extend([node["z"], other["z"], None])
     return {"x": x, "y": y, "z": z, "n_nodes": len(nodes), "n_edges": len(seen)}
+
+
+def _centerline_adjacency(nodes: dict) -> dict[int, set[int]]:
+    adj = {int(nid): set() for nid in nodes}
+    for nid, node in nodes.items():
+        nid = int(nid)
+        for nb in (node.get("parent"), node.get("left"), node.get("right")):
+            if nb is None or nb < 0 or nb not in nodes:
+                continue
+            nb = int(nb)
+            adj[nid].add(nb)
+            adj[nb].add(nid)
+    return adj
+
+
+def _path_length_from_nodes(path: list[int], nodes: dict) -> float:
+    if len(path) < 2:
+        return 0.0
+    coords = np.asarray([
+        [nodes[nid]["x"], nodes[nid]["y"], nodes[nid]["z"]]
+        for nid in path if nid in nodes
+    ], dtype=float)
+    if len(coords) < 2:
+        return 0.0
+    return float(np.sum(np.linalg.norm(np.diff(coords, axis=0), axis=1)))
+
+
+def _editable_centerline_branches(nodes: dict | None) -> list[dict]:
+    """Return terminal endpoint-to-branchpoint paths that may be removed."""
+    if not nodes:
+        return []
+    adj = _centerline_adjacency(nodes)
+    endpoints = [nid for nid, nbs in adj.items() if len(nbs) == 1]
+    out = []
+    seen = set()
+
+    for endpoint in endpoints:
+        path = [endpoint]
+        prev = None
+        cur = endpoint
+        while True:
+            neighbors = [n for n in adj[cur] if n != prev]
+            if len(neighbors) != 1:
+                break
+            nxt = neighbors[0]
+            path.append(nxt)
+            degree = len(adj[nxt])
+            if degree != 2:
+                if degree >= 3:
+                    endpoint_to_junction = path
+                    junction_to_endpoint = list(reversed(endpoint_to_junction))
+                    key = (endpoint, nxt)
+                    if key in seen:
+                        break
+                    seen.add(key)
+                    coords = _coords_for_path(junction_to_endpoint, nodes)
+                    if coords is None:
+                        break
+                    branch_id = f"{endpoint}:{nxt}"
+                    out.append({
+                        "id": branch_id,
+                        "endpoint_id": int(endpoint),
+                        "junction_id": int(nxt),
+                        "path": [int(n) for n in junction_to_endpoint],
+                        "x": coords[:, 0].tolist(),
+                        "y": coords[:, 1].tolist(),
+                        "z": coords[:, 2].tolist(),
+                        "length_mm": _path_length_from_nodes(endpoint_to_junction, nodes),
+                        "n_points": len(endpoint_to_junction),
+                    })
+                break
+            prev = cur
+            cur = nxt
+
+    out.sort(key=lambda item: item["length_mm"], reverse=True)
+    return out
+
+
+def _rebuild_centerline_tree(nodes: dict, adj: dict[int, set[int]]) -> list[list[float | int]]:
+    remaining = sorted(nid for nid in nodes if nid in adj)
+    if not remaining:
+        raise ValueError("Centerline would be empty after deletion.")
+
+    root_candidates = [nid for nid in remaining if nodes[nid].get("parent") == -1]
+    if root_candidates:
+        root = root_candidates[0]
+    else:
+        endpoints = [nid for nid in remaining if len(adj.get(nid, set())) <= 1]
+        root = endpoints[0] if endpoints else remaining[0]
+
+    visited = {root}
+    queue = deque([(root, -1)])
+    bfs_order = []
+    while queue:
+        node, parent = queue.popleft()
+        bfs_order.append((node, parent))
+        for nb in sorted(adj.get(node, set())):
+            if nb in visited:
+                continue
+            visited.add(nb)
+            queue.append((nb, node))
+
+    if len(visited) != len(remaining):
+        largest = _largest_component_nodes(adj)
+        dropped = set(remaining) - largest
+        if not largest:
+            raise ValueError("Centerline has no connected component after deletion.")
+        root = root if root in largest else sorted(largest)[0]
+        visited = {root}
+        queue = deque([(root, -1)])
+        bfs_order = []
+        while queue:
+            node, parent = queue.popleft()
+            bfs_order.append((node, parent))
+            for nb in sorted(adj.get(node, set())):
+                if nb in visited or nb not in largest:
+                    continue
+                visited.add(nb)
+                queue.append((nb, node))
+        if dropped:
+            print(f"       [warn] centerline edit dropped disconnected nodes: {len(dropped)}")
+
+    old_to_new = {old: idx for idx, (old, _) in enumerate(bfs_order)}
+    children = {old: [] for old, _ in bfs_order}
+    for old, parent in bfs_order:
+        if parent != -1 and parent in children:
+            children[parent].append(old)
+
+    tree = []
+    for old, parent in bfs_order:
+        node = nodes[old]
+        child_ids = children[old]
+        tree.append([
+            old_to_new[old],
+            float(node["x"]),
+            float(node["y"]),
+            float(node["z"]),
+            old_to_new[parent] if parent != -1 else -1,
+            old_to_new[child_ids[0]] if len(child_ids) >= 1 else -1,
+            old_to_new[child_ids[1]] if len(child_ids) >= 2 else -1,
+        ])
+    return tree
+
+
+def _largest_component_nodes(adj: dict[int, set[int]]) -> set[int]:
+    remaining = set(adj)
+    best = set()
+    while remaining:
+        start = next(iter(remaining))
+        comp = {start}
+        queue = deque([start])
+        remaining.discard(start)
+        while queue:
+            cur = queue.popleft()
+            for nb in adj.get(cur, set()):
+                if nb not in remaining:
+                    continue
+                remaining.discard(nb)
+                comp.add(nb)
+                queue.append(nb)
+        if len(comp) > len(best):
+            best = comp
+    return best
+
+
+def _write_centerline_tree(path: Path, tree: list[list[float | int]]):
+    with path.open("w", encoding="utf-8") as f:
+        for row in tree:
+            f.write(" ".join(str(v) for v in row) + "\n")
+
+
+def delete_centerline_terminal_branches(stl_path: Path, branch_ids: list[str]) -> dict:
+    parent = stl_path.parent
+    centerline_path = parent / "CenterlinePoints.txt"
+    nodes = _read_centerline_file(centerline_path)
+    if not nodes:
+        raise ValueError("CenterlinePoints.txt not found or empty.")
+
+    requested = {str(item) for item in branch_ids if str(item)}
+    editable = {item["id"]: item for item in _editable_centerline_branches(nodes)}
+    invalid = sorted(requested - set(editable))
+    if invalid:
+        raise ValueError(f"Only endpoint-to-branchpoint branches can be deleted. Invalid: {', '.join(invalid)}")
+    if not requested:
+        return {"deleted": [], "remaining_branches": list(editable.values()), "removed_nodes": 0}
+
+    remove_nodes = set()
+    deleted = []
+    for branch_id in sorted(requested):
+        item = editable[branch_id]
+        path = list(reversed(item["path"]))  # endpoint -> junction
+        junction = item["junction_id"]
+        remove_nodes.update(n for n in path if n != junction)
+        deleted.append(item)
+
+    kept_nodes = {nid: node for nid, node in nodes.items() if nid not in remove_nodes}
+    if len(kept_nodes) < 2:
+        raise ValueError("Cannot delete branches because the centerline would become too small.")
+
+    adj = _centerline_adjacency(kept_nodes)
+    tree = _rebuild_centerline_tree(kept_nodes, adj)
+    _write_centerline_tree(centerline_path, tree)
+
+    # Downstream files are derived from the old raw centerline. Remove them so
+    # smoothing/segmentation/features recompute from the edited raw tree.
+    stale_outputs = [
+        "newCenterlist.txt",
+        "centerline_profiles.json",
+        "centerline_pointwise_profiles.json",
+        "portal_vein_features.json",
+        "unified_features.json",
+        "feature_description.json",
+        "sv_smv_angle.json",
+        "vis_interactive.html",
+        "vis_overview.png",
+        "centerline_screenshot.png",
+        "segment_screenshot.png",
+    ]
+    removed_outputs = []
+    for name in stale_outputs:
+        p = parent / name
+        if p.exists():
+            try:
+                p.unlink()
+                removed_outputs.append(name)
+            except Exception:
+                pass
+
+    new_nodes = _read_centerline_file(centerline_path)
+    return {
+        "deleted": deleted,
+        "removed_nodes": len(remove_nodes),
+        "removed_outputs": removed_outputs,
+        "remaining_branches": _editable_centerline_branches(new_nodes),
+    }
 
 
 def _coords_for_path(path: list[int], nodes: dict) -> np.ndarray | None:
@@ -860,6 +1096,9 @@ def build_visualization_data(stl_path: Path, section_stride: int = 10, max_faces
             "raw": _line_arrays_from_nodes(raw_nodes),
             "smooth": _line_arrays_from_nodes(smooth_nodes),
         },
+        "centerline_edit": {
+            "branches": _editable_centerline_branches(raw_nodes),
+        },
         "segments": _build_segments(seg_data, nodes),
         "branch_points": branch_points,
         "pointwise": pointwise_layers,
@@ -1171,6 +1410,8 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 self._handle_create_session()
             elif parsed.path == "/api/run":
                 self._handle_run()
+            elif parsed.path == "/api/centerline/delete-branches":
+                self._handle_delete_centerline_branches()
             else:
                 self._send_json({"error": "Not found"}, status=404)
         except Exception as exc:
@@ -1298,6 +1539,22 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         )
         thread.start()
         self._send_json({"job": job})
+
+    def _handle_delete_centerline_branches(self):
+        payload = self._read_json_body()
+        session_id = str(payload.get("session_id") or "")
+        patient_id = payload.get("patient_id")
+        branch_ids = payload.get("branch_ids") or []
+        with STATE_LOCK:
+            session = SESSIONS.get(session_id)
+        if not session:
+            raise ValueError("Unknown session.")
+        patient = _resolve_patient(session, patient_id)
+        if not patient:
+            raise ValueError("Patient not found.")
+        result = delete_centerline_terminal_branches(
+            Path(patient["stl_path"]), [str(item) for item in branch_ids])
+        self._send_json({"ok": True, "result": result})
 
     def _handle_job(self, path: str):
         job_id = path.rstrip("/").split("/")[-1]
